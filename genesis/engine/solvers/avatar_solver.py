@@ -1,11 +1,11 @@
 import numpy as np
 import taichi as ti
-import genesis as gs
+
 from genesis.engine.entities import AvatarEntity
 from genesis.engine.states.solvers import AvatarSolverState
 
 from .base_solver import Solver
-from .rigid.rigid_solver_decomp import RigidSolver
+from .rigid.rigid_solver import RigidSolver
 
 
 @ti.data_oriented
@@ -24,9 +24,13 @@ class AvatarSolver(RigidSolver):
         # options
         self._enable_collision = options.enable_collision
         self._enable_self_collision = options.enable_self_collision
-        self._enable_adjacent_collision = options.enable_adjacent_collision
-        self._max_collision_pairs = options.max_collision_pairs
-        self._options = options
+        self._max_collision_pairs   = options.max_collision_pairs
+
+        self._use_hibernation = options.use_hibernation
+        self._hibernation_thresh_vel = options.hibernation_thresh_vel
+        self._hibernation_thresh_acc = options.hibernation_thresh_acc
+
+        self._options               = options
 
     def _init_mass_mat(self):
         self.entity_max_dofs = max([entity.n_dofs for entity in self._entities])
@@ -47,24 +51,26 @@ class AvatarSolver(RigidSolver):
     @ti.kernel
     def _kernel_step(self):
         self._func_integrate()
-
-        ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
-        for i_b in range(self._B):
-            self._func_forward_kinematics(i_b)
-            self._func_update_geoms(i_b)
+        self._func_forward_kinematics()
+        self._func_update_geoms()
         if self._enable_collision:
             self._func_detect_collision()
 
     @ti.kernel
-    def _kernel_forward_kinematics_links_geoms(self, envs_idx: ti.types.ndarray()):
-        for i_b in envs_idx:
-            self._func_forward_kinematics(i_b)
-            self._func_update_geoms(i_b)
+    def _kernel_forward_kinematics_links_geoms(self):
+        self._func_forward_kinematics()
+        self._func_update_geoms()
 
     @ti.func
     def _func_detect_collision(self):
         self.collider.clear()
         self.collider.detection()
+
+    def set_state(self, f, state, envs_idx):
+        if self.is_active():
+            self._kernel_set_state(state.qpos, state.dofs_vel, state.links_pos, state.links_quat)
+            self._kernel_forward_kinematics_links_geoms()
+            self.collider.reset()
 
     def get_state(self, f):
         if self.is_active():
@@ -74,13 +80,13 @@ class AvatarSolver(RigidSolver):
             state = None
         return state
 
-    def print_contact_data(self):
+    def detect_collision(self):
         batch_idx = 0
-        n_contacts = self.collider.n_contacts[batch_idx]
-        print("collision_pairs:")
-        if n_contacts > 0:
-            contact_data = self.collider.contact_data.to_numpy()
-            links_a = contact_data["link_a"][:n_contacts, batch_idx]
-            links_b = contact_data["link_b"][:n_contacts, batch_idx]
-            link_pairs = np.vstack([links_a, links_b]).T
-            print(link_pairs)
+        n_collision = self.collider.n_contacts.to_numpy()[batch_idx]
+        if n_collision > 0:
+            collision_pairs = np.empty((n_collision, 2), dtype=np.int32)
+            collision_pairs[:, 0] = self.collider.contact_data.geom_a.to_numpy()[:n_collision, batch_idx]
+            collision_pairs[:, 1] = self.collider.contact_data.geom_b.to_numpy()[:n_collision, batch_idx]
+            return collision_pairs
+        else:
+            return np.array([])

@@ -70,8 +70,8 @@ class Rigid(Material):
         if coup_restitution != 0:
             gs.logger.warning("Non-zero `coup_restitution` could lead to instability. Use with caution.")
 
-        if sdf_min_res < 16:
-            gs.raise_exception("`sdf_min_res` must be at least 16.")
+        # if sdf_min_res < 16:
+        #     gs.raise_exception('`sdf_min_res` must be at least 16.')
 
         if sdf_min_res > sdf_max_res:
             gs.raise_exception("`sdf_min_res` must be smaller than or equal to `sdf_max_res`.")

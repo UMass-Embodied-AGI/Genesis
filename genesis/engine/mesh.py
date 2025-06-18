@@ -85,7 +85,7 @@ class Mesh(RBC):
         """
         if self._mesh.vertices.shape[0] > 3:
             self._mesh = trimesh.convex.convex_hull(self._mesh)
-        self.clear_visuals()
+            self.clear_visuals()
 
     def decimate(self, decimate_face_num, decimate_aggressiveness, convexify):
         """
@@ -107,7 +107,7 @@ class Mesh(RBC):
             if convexify:
                 self.convexify()
 
-        self.clear_visuals()
+            self.clear_visuals()
 
     def remesh(self, edge_len_abs=None, edge_len_ratio=0.01, fix=True):
         """
@@ -231,8 +231,7 @@ class Mesh(RBC):
             surface = gs.surfaces.Default()
         else:
             surface = surface.copy()
-        mesh = mesh.copy(include_cache=True)
-
+        mesh = mesh.copy(include_cache=True,include_visual=True)
         try:  # always parse uvs because roughness and normal map also need uvs
             uvs = mesh.visual.uv.copy()
             uvs[:, 1] = 1.0 - uvs[:, 1]  # trimesh uses uvs starting from top left corner

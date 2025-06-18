@@ -3,6 +3,8 @@ import math
 import os
 import pickle as pkl
 from scipy.spatial.transform import Rotation as R
+from urllib import request
+from io import BytesIO
 
 import numpy as np
 import trimesh
@@ -17,6 +19,8 @@ import tetgen
 import genesis as gs
 from genesis.ext import fast_simplification
 
+from tqdm import tqdm
+
 from . import geom as gu
 from .misc import (
     get_assets_dir,
@@ -30,20 +34,16 @@ from .misc import (
 
 MESH_REPAIR_ERROR_THRESHOLD = 0.01
 
-
 class MeshInfo:
-    def __init__(self):
-        self.surface = None
-        self.metadata = {}
-        self.verts = []
-        self.faces = []
-        self.normals = []
-        self.uvs = []
-        self.n_points = 0
-
-    def set_property(self, surface=None, metadata=None):
+    def __init__(self, surface=None):
         self.surface = surface
-        self.metadata = metadata
+        self.verts = list()
+        self.faces = list()
+        self.normals = list()
+        self.uvs = list()
+        self.n_points = 0
+        self.n_members = 0
+        self.uvs_exist = False
 
     def append(self, verts, faces, normals, uvs):
         faces += self.n_points
@@ -51,7 +51,10 @@ class MeshInfo:
         self.faces.append(faces)
         self.normals.append(normals)
         self.uvs.append(uvs)
-        self.n_points += len(verts)
+        self.n_points += verts.shape[0]
+        self.n_members += 1
+        if uvs is not None:
+            self.uvs_exist = True
 
     def export_mesh(self, scale):
         if self.uvs:
@@ -74,9 +77,11 @@ class MeshInfo:
             uvs=uvs,
             scale=scale,
         )
-        mesh.metadata.update(self.metadata)
         return mesh
 
+    def set_property(self, surface=None, metadata=None):
+        self.surface = surface
+        self.metadata = metadata
 
 class MeshInfoGroup:
     def __init__(self):
@@ -89,6 +94,11 @@ class MeshInfoGroup:
             mesh_info = self.infos.setdefault(name, MeshInfo())
             first_created = True
         return mesh_info, first_created
+
+    def append(self, name, verts, faces, normals, uvs, surface):
+        if name not in self.infos:
+            self.infos[name] = MeshInfo(surface)
+        self.infos[name].append(verts, faces, normals, uvs)
 
     def export_meshes(self, scale):
         return [mesh_info.export_mesh(scale) for mesh_info in self.infos.values()]
@@ -210,6 +220,8 @@ def voxelize_mesh(mesh, res):
 
 def surface_uvs_to_trimesh_visual(surface, uvs=None, n_verts=None):
     texture = surface.get_rgba()
+    texture.check_dim(3)
+    # texture = surface.get_texture()
 
     if isinstance(texture, gs.textures.ImageTexture):
         if uvs is not None:
@@ -219,7 +231,7 @@ def surface_uvs_to_trimesh_visual(surface, uvs=None, n_verts=None):
             visual = trimesh.visual.TextureVisuals(
                 uv=uvs,
                 material=trimesh.visual.material.SimpleMaterial(
-                    image=Image.fromarray(texture.image_array), diffuse=(1.0, 1.0, 1.0, 1.0)
+                    texture.image_array, diffuse=(1.0, 1.0, 1.0, 1.0)
                 ),
             )
         else:
@@ -316,7 +328,7 @@ def postprocess_collision_geoms(
                 tmesh._cache.clear()
                 tmesh.visual._cache.clear()
 
-    # Check if all the geometries can be convexified without decomposition
+    # Check if all the geometries can be convexify without decomposition
     must_decompose = False
     if convexify:
         for g_info in g_infos:
@@ -486,6 +498,15 @@ def create_texture(image, factor, encoding):
     else:
         return None
 
+def opacity_from_texture(color_texture, alpha_cutoff=None):
+    opacity_texture = color_texture.check_dim(3)
+    if opacity_texture is not None:
+        if alpha_cutoff is not None:
+            opacity_texture.apply_cutoff(alpha_cutoff)
+        if isinstance(opacity_texture, gs.textures.ImageTexture) and opacity_texture.image_array.max() == opacity_texture.image_array.min():
+            alpha = opacity_texture.image_array.max() / 255.0
+            opacity_texture = create_texture(None, (alpha,), 'linear')
+    return opacity_texture
 
 def apply_transform(transform, positions, normals=None):
     transformed_positions = (np.column_stack([positions, np.ones(len(positions))]) @ transform)[:, :3]
@@ -501,6 +522,420 @@ def apply_transform(transform, positions, normals=None):
 
     return transformed_positions, transformed_normals
 
+def parse_tree(nodes, node_index):
+    node = nodes[node_index]
+    if node.matrix is not None:
+        matrix = np.array(node.matrix, dtype=float).reshape((4, 4))
+    else:
+        matrix = np.identity(4, dtype=float)
+        if node.translation is not None:
+            translation = np.array(node.translation, dtype=float)
+            translation_matrix = np.identity(4, dtype=float)
+            translation_matrix[3, :3] = translation
+            matrix = translation_matrix @ matrix
+        if node.rotation is not None:
+            rotation = np.array(node.rotation, dtype=float)     # xyzw
+            rotation_matrix = np.identity(4, dtype=float)
+            rotation = [rotation[3], rotation[0], rotation[1], rotation[2]]
+            rotation_matrix[:3, :3] = trimesh.transformations.quaternion_matrix(rotation)[:3, :3].T
+            matrix = rotation_matrix @ matrix
+        if node.scale is not None:
+            scale = np.array(node.scale, dtype=float)
+            scale_matrix = np.diag(np.append(scale, 1))
+            matrix = scale_matrix @ matrix
+    mesh_list = list()
+    if node.mesh is not None:
+        mesh_list.append([node.mesh, np.identity(4, dtype=float)])
+    for sub_node_index in node.children:
+        sub_mesh_list = parse_tree(nodes, sub_node_index)
+        mesh_list.extend(sub_mesh_list)
+    for i in range(len(mesh_list)):
+        mesh_list[i][1] = mesh_list[i][1] @ matrix
+    return mesh_list
+
+    def get_bufferview_data(buffer_view):
+        buffer = glb.buffers[buffer_view.buffer]
+        return glb.get_data_from_buffer_uri(buffer.uri)
+
+    def get_data_from_accessor(accessor_index):
+        accessor = glb.accessors[accessor_index]
+        buffer_view = glb.bufferViews[accessor.bufferView]
+        buffer_data = get_bufferview_data(buffer_view)
+
+        data_type, data_ctype, count = accessor.type, accessor.componentType, accessor.count
+        dtype = ctype_to_numpy[data_ctype][1]
+        itemsize = np.dtype(dtype).itemsize
+        buffer_byte_offset = (buffer_view.byteOffset or 0) + (accessor.byteOffset or 0)
+        num_components = type_to_count[data_type][0]
+
+        byte_stride = buffer_view.byteStride if buffer_view.byteStride else num_components * itemsize
+        # Extract data considering byteStride
+        if byte_stride == num_components * itemsize:
+            # Data is tightly packed
+            byte_length = count * num_components * itemsize
+            data = buffer_data[buffer_byte_offset : buffer_byte_offset + byte_length]
+            array = np.frombuffer(data, dtype=dtype)
+            if num_components > 1:
+                array = array.reshape((count, num_components))
+        else:
+            # Data is interleaved
+            array = np.zeros((count, num_components), dtype=dtype)
+            for i in range(count):
+                start = buffer_byte_offset + i * byte_stride
+                end = start + num_components * itemsize
+                data_slice = buffer_data[start:end]
+                array[i] = np.frombuffer(data_slice, dtype=dtype, count=num_components)
+
+        return array.reshape([count] + type_to_count[data_type][1])
+
+    glb.convert_images(pygltflib.ImageFormat.DATAURI)
+
+    scene = glb.scenes[glb.scene]
+    mesh_list = list()
+    for node_index in scene.nodes:
+        root_mesh_list = parse_tree(node_index)
+        mesh_list.extend(root_mesh_list)
+
+    temp_infos = dict()
+    for i in range(len(mesh_list)):
+        mesh = glb.meshes[mesh_list[i][0]]
+        matrix = mesh_list[i][1]
+        for primitive in mesh.primitives:
+            if group_by_material:
+                group_idx = primitive.material
+            else:
+                group_idx = i
+
+            uvs0, uvs1 = None, None
+            if "KHR_draco_mesh_compression" in primitive.extensions:
+                import DracoPy
+
+                KHR_index = primitive.extensions["KHR_draco_mesh_compression"]["bufferView"]
+                mesh_buffer_view = glb.bufferViews[KHR_index]
+                mesh_data = get_bufferview_data(mesh_buffer_view)
+                mesh = DracoPy.decode(
+                    mesh_data[mesh_buffer_view.byteOffset : mesh_buffer_view.byteOffset + mesh_buffer_view.byteLength]
+                )
+                points = mesh.points
+                triangles = mesh.faces
+                normals = mesh.normals if len(mesh.normals) > 0 else None
+                uvs0 = mesh.tex_coord if len(mesh.tex_coord) > 0 else None
+
+            else:
+                # "primitive.attributes" records accessor indices in "glb.accessors", like:
+                #      Attributes(POSITION=2, NORMAL=1, TANGENT=None, TEXCOORD_0=None, TEXCOORD_1=None,
+                #                 COLOR_0=None, JOINTS_0=None, WEIGHTS_0=None)
+                # parse vertices
+
+                points = get_data_from_accessor(primitive.attributes.POSITION).astype(float)
+
+                if primitive.indices is None:
+                    indices = np.arange(points.shape[0], dtype=np.uint32)
+                else:
+                    indices = get_data_from_accessor(primitive.indices).astype(np.int32)
+
+                mode = primitive.mode if primitive.mode is not None else 4
+
+                if mode == 4:  # TRIANGLES
+                    triangles = indices.reshape(-1, 3)
+                elif mode == 5:  # TRIANGLE_STRIP
+                    triangles = []
+                    for i in range(len(indices) - 2):
+                        if i % 2 == 0:
+                            triangles.append([indices[i], indices[i + 1], indices[i + 2]])
+                        else:
+                            triangles.append([indices[i], indices[i + 2], indices[i + 1]])
+                    triangles = np.array(triangles, dtype=np.uint32)
+                elif mode == 6:  # TRIANGLE_FAN
+                    triangles = []
+                    for i in range(1, len(indices) - 1):
+                        triangles.append([indices[0], indices[i], indices[i + 1]])
+                    triangles = np.array(triangles, dtype=np.uint32)
+                else:
+                    gs.logger.warning(f"Primitive mode {mode} not supported.")
+                    continue  # Skip unsupported modes
+
+                # parse normals
+                if primitive.attributes.NORMAL:
+                    normals = get_data_from_accessor(primitive.attributes.NORMAL).astype(float)
+                else:
+                    normals = None
+
+                # parse uvs
+                if primitive.attributes.TEXCOORD_0:
+                    uvs0 = get_data_from_accessor(primitive.attributes.TEXCOORD_0).astype(float)
+                if primitive.attributes.TEXCOORD_1:
+                    uvs1 = get_data_from_accessor(primitive.attributes.TEXCOORD_1).astype(float)
+
+            if normals is None:
+                normals = trimesh.Trimesh(points, triangles, process=False).vertex_normals
+            points, normals = apply_transform(matrix, points, normals)
+
+            if group_idx not in temp_infos.keys():
+                temp_infos[group_idx] = {
+                    "mat_index": primitive.material,
+                    "points": [points],
+                    "triangles": [triangles],
+                    "normals": [normals],
+                    "uvs0": [uvs0],
+                    "uvs1": [uvs1],
+                    "n_points": len(points),
+                }
+
+            else:
+                triangles += temp_infos[group_idx]["n_points"]
+                temp_infos[group_idx]["points"].append(points)
+                temp_infos[group_idx]["triangles"].append(triangles)
+                temp_infos[group_idx]["normals"].append(normals)
+                temp_infos[group_idx]["uvs0"].append(uvs0)
+                temp_infos[group_idx]["uvs1"].append(uvs1)
+                temp_infos[group_idx]["n_points"] += len(points)
+
+    meshes = list()
+    for group_idx in temp_infos.keys():
+        # parse images
+        color_texture = None
+        opacity_texture = None
+        roughness_texture = None
+        metallic_texture = None
+        normal_texture = None
+        emissive_texture = None
+
+        alpha_cutoff = None
+        double_sided = None
+        ior = None
+        uvs_used = 0
+
+        if temp_infos[group_idx]["mat_index"] is not None:
+            material = glb.materials[temp_infos[group_idx]["mat_index"]]
+            double_sided = material.doubleSided
+
+            # parse normal map
+            if material.normalTexture is not None:
+                texture = glb.textures[material.normalTexture.index]
+                uvs_used = material.normalTexture.texCoord
+                image_index = texture.source
+                image = Image.open(uri_to_PIL(glb.images[image_index].uri))
+                normal_texture = create_texture(np.array(image), None, "linear")
+
+            # TODO: Parse occlusion
+            if material.occlusionTexture is not None:
+                texture = glb.textures[material.normalTexture.index]
+                uvs_used = material.normalTexture.texCoord
+                image_index = texture.source
+                image = Image.open(uri_to_PIL(glb.images[image_index].uri))
+                occlusion_texture = create_texture(np.array(image), None, "linear")
+
+            # parse alpha mode
+            if material.alphaMode == "OPAQUE":
+                alpha_cutoff = 0.0
+            elif material.alphaMode == "MASK":
+                alpha_cutoff = material.alphaCutoff
+            else:
+                alpha_cutoff = None
+
+            # parse pbr roughness and metallic
+            if material.pbrMetallicRoughness is not None:
+                pbr_texture = material.pbrMetallicRoughness
+
+                # parse metallic and roughness
+                roughness_image = None
+                metallic_image = None
+                if pbr_texture.metallicRoughnessTexture is not None:
+                    texture = glb.textures[pbr_texture.metallicRoughnessTexture.index]
+                    uvs_used = pbr_texture.metallicRoughnessTexture.texCoord
+                    image_index = texture.source
+                    image = Image.open(uri_to_PIL(glb.images[image_index].uri))
+                    bands = image.split()
+                    if len(bands) == 1:
+                        roughness_image = np.array(bands[0])
+                    else:
+                        roughness_image = np.array(bands[1])  # G for roughness
+                        metallic_image = np.array(bands[2])  # B for metallic
+                        # metallic_image = np.array(bands[0])     # R for metallic????
+
+                metallic_factor = None
+                if pbr_texture.metallicFactor is not None:
+                    metallic_factor = (pbr_texture.metallicFactor,)
+
+                roughness_factor = None
+                if pbr_texture.roughnessFactor is not None:
+                    roughness_factor = (pbr_texture.roughnessFactor,)
+
+                metallic_texture = create_texture(metallic_image, metallic_factor, "linear")
+                roughness_texture = create_texture(roughness_image, roughness_factor, "linear")
+
+                # Check if material has a base color texture
+                color_image = None
+                if pbr_texture.baseColorTexture is not None:
+                    texture = glb.textures[pbr_texture.baseColorTexture.index]
+                    uvs_used = pbr_texture.baseColorTexture.texCoord
+                    image_index = texture.source
+                    image = Image.open(uri_to_PIL(glb.images[image_index].uri))
+                    color_image = np.array(image.convert("RGBA"))
+
+                # parse color
+                color_factor = None
+                if pbr_texture.baseColorFactor is not None:
+                    color_factor = np.array(pbr_texture.baseColorFactor, dtype=float)
+
+                color_texture = create_texture(color_image, color_factor, "srgb")
+
+            elif "KHR_materials_pbrSpecularGlossiness" in material.extensions:
+                extension_material = material.extensions["KHR_materials_pbrSpecularGlossiness"]
+                color_image = None
+                if "diffuseTexture" in extension_material:
+                    texture = extension_material["diffuseTexture"]
+                    uvs_used = texture["texCoord"]
+                    image = Image.open(uri_to_PIL(glb.images[texture["index"]].uri))
+                    color_image = np.array(image.convert("RGBA"))
+
+                color_factor = None
+                if "diffuseFactor" in extension_material:
+                    color_factor = np.array(extension_material["diffuseFactor"], dtype=float)
+
+                color_texture = create_texture(color_image, color_factor, "srgb")
+
+            if color_texture is not None:
+                opacity_texture = color_texture.check_dim(3)
+                if opacity_texture is not None:
+                    opacity_texture.apply_cutoff(alpha_cutoff)
+
+            # TODO: Parse them!
+            if "KHR_materials_specular" in material.extensions:
+                extension_material = material.extensions["KHR_materials_specular"]
+                if "specularColorFactor" in extension_material:
+                    specular_color = np.array(extension_material["specularColorFactor"], dtype=float)
+
+            if "KHR_materials_transmission" in material.extensions:
+                extension_material = material.extensions["KHR_materials_transmission"]
+                specular_transmission = extension_material["transmissionFactor"]  # e.g. 1
+
+            if "KHR_materials_ior" in material.extensions:
+                extension_material = material.extensions["KHR_materials_ior"]
+                ior = extension_material["ior"]  # e.g. 1.4500000476837158
+
+            if "KHR_materials_unlit" in material.extensions:
+                # No unlit material implemented in renderers. Use emissive texture.
+                if color_texture is not None:
+                    emissive_texture = color_texture
+                    color_texture = None
+            else:
+                # parse emissive
+                emissive_image = None
+                if material.emissiveTexture is not None:
+                    texture = glb.textures[material.emissiveTexture.index]
+                    uvs_used = material.emissiveTexture.texCoord
+                    image_index = texture.source
+                    image = Image.open(uri_to_PIL(glb.images[image_index].uri))
+                    if image.mode != "RGB":
+                        image = image.convert("RGB")
+                    emissive_image = np.array(image)
+
+                emissive_factor = None
+                if material.emissiveFactor is not None:
+                    emissive_factor = np.array(material.emissiveFactor, dtype=float)
+
+                if emissive_factor is not None and np.any(emissive_factor > 0.0):
+                    emissive_texture = create_texture(emissive_image, emissive_factor, "srgb")
+
+        # repair uv
+        group_uvs = temp_infos[group_idx]["uvs1"] if uvs_used == 1 else temp_infos[group_idx]["uvs0"]
+        group_points = temp_infos[group_idx]["points"]
+        member_count = len(group_points)
+        group_uv_exist = False
+
+        for i in range(member_count):
+            if group_uvs[i] is not None:
+                group_uv_exist = True
+
+        if group_uv_exist:
+            for i in range(member_count):
+                num_points = group_points[i].shape[0]
+                if group_uvs[i] is None:
+                    group_uvs[i] = np.zeros((num_points, 2), dtype=float)
+            uvs = np.concatenate(group_uvs)
+        else:
+            uvs = None
+
+        # build other group properties
+        verts = np.concatenate(temp_infos[group_idx]["points"])
+        normals = np.concatenate(temp_infos[group_idx]["normals"])
+        faces = np.concatenate(temp_infos[group_idx]["triangles"])
+
+        group_surface = surface.copy()
+        group_surface.update_texture(
+            color_texture=color_texture,
+            opacity_texture=opacity_texture,
+            roughness_texture=roughness_texture,
+            metallic_texture=metallic_texture,
+            normal_texture=normal_texture,
+            emissive_texture=emissive_texture,
+            ior=ior,
+            double_sided=double_sided,
+        )
+
+        meshes.append(
+            gs.Mesh.from_attrs(
+                verts=verts,
+                faces=faces,
+                normals=normals,
+                surface=group_surface,
+                uvs=uvs,
+                scale=scale,
+            )
+        )
+
+    return meshes
+
+
+def PIL_to_array(image):
+    return np.array(image)
+
+
+def uri_to_PIL(data_uri):
+    with request.urlopen(data_uri) as response:
+        data = response.read()
+    return BytesIO(data)
+
+
+def tonemapped(image):
+    exposure = 0.5
+    return (np.clip(np.power(image / 255 * np.power(2, exposure), 1 / 2.2), 0, 1) * 255).astype(np.uint8)
+
+
+def create_texture(image, factor, encoding):
+    if image is not None:
+        return gs.textures.ImageTexture(image_array=image, image_color=factor, encoding=encoding)
+    elif factor is not None:
+        return gs.textures.ColorTexture(color=factor)
+    else:
+        return None
+
+def opacity_from_texture(color_texture, alpha_cutoff=None):
+    opacity_texture = color_texture.check_dim(3)
+    if opacity_texture is not None:
+        if alpha_cutoff is not None:
+            opacity_texture.apply_cutoff(alpha_cutoff)
+        if isinstance(opacity_texture, gs.textures.ImageTexture) and opacity_texture.image_array.max() == opacity_texture.image_array.min():
+            alpha = opacity_texture.image_array.max() / 255.0
+            opacity_texture = create_texture(None, (alpha,), 'linear')
+    return opacity_texture
+
+
+def apply_transform(transform, positions, normals=None):
+    transformed_positions = (np.column_stack([positions, np.ones(len(positions))]) @ transform)[:, :3]
+
+    transformed_normals = normals
+    if normals is not None:
+        rot_mat = transform[:3, :3]
+        if np.abs(3.0 - np.trace(rot_mat)) > gs.EPS**2:  # has rotation or scaling
+            transformed_normals = normals @ rot_mat
+            scale = np.linalg.norm(rot_mat, axis=1, keepdims=True)
+            if np.any(np.abs(scale - 1.0) > gs.EPS):  # has scale
+                transformed_normals /= np.linalg.norm(transformed_normals, axis=1, keepdims=True)
+
+    return transformed_positions, transformed_normals
 
 def create_frame(
     origin_radius=0.012, axis_radius=0.005, axis_length=1.0, head_radius=0.01, head_length=0.03, sections=12
@@ -791,8 +1226,61 @@ def create_cylinder(radius, height, sections=None, color=(1.0, 1.0, 1.0, 1.0)):
     mesh.visual = trimesh.visual.ColorVisuals(vertex_colors=np.tile(color, [len(mesh.vertices), 1]).astype(float))
     return mesh
 
+def convexify(verts, faces, normals):
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals, process=False)
+    if mesh.vertices.shape[0] > 3:
+        mesh = trimesh.convex.convex_hull(mesh)
+    return mesh.vertices.copy(), mesh.faces.copy(), mesh.vertex_normals.copy()
 
-def create_plane(size=1e3, color=None, normal=(0, 0, 1)):
+def decimate(verts, faces, normals, target_face_num):
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals, process=False)
+    mesh = mesh.simplify_quadratic_decimation(target_face_num)
+    return mesh.vertices.copy(), mesh.faces.copy(), mesh.vertex_normals.copy()
+
+def get_unique_edges(vert: np.ndarray, face: np.ndarray) -> np.ndarray:
+    '''
+    Returns unique edges.
+
+    Args:
+    vert: (n_vert, 3) vertices
+    face: (n_face, n_vert) face index array
+
+    Returns:
+    edges: 2-tuples of vertex indexes for each edge
+    '''
+    # return np.array([[0, 1]])
+
+    r_face = np.roll(face, 1, axis=1)
+    edges = np.concatenate(np.array([face, r_face]).T)
+
+    # do a first pass to remove duplicates
+    edges.sort(axis=1)
+    edges = np.unique(edges, axis=0)
+    edges = edges[edges[:, 0] != edges[:, 1]]
+
+    return edges
+
+ctype_to_numpy = {
+    5120: (1, np.int8),     # BYTE
+    5121: (1, np.uint8),    # UNSIGNED_BYTE
+    5122: (2, np.int16),    # SHORT
+    5123: (2, np.uint16),   # UNSIGNED_SHORT
+    5124: (4, np.int32),    # INT
+    5125: (4, np.uint32),   # UNSIGNED_INT
+    5126: (4, np.float32),  # FLOAT
+}
+
+type_to_count = {
+    "SCALAR": (1, []),
+    "VEC2": (2, [2]),
+    "VEC3": (3, [3]),
+    "VEC4": (4, [4]),
+    "MAT2": (4, [2, 2]),
+    "MAT3": (9, [3, 3]),
+    "MAT4": (16, [4, 4]),
+}
+
+def create_plane(size=1000, color=None, normal=(0, 0, 1)):
     thickness = 1e-2  # for safety
     mesh = trimesh.creation.box(extents=[size, size, thickness])
     mesh.vertices[:, 2] -= thickness / 2
@@ -904,3 +1392,406 @@ def visualize_tet(tet, pv_data, show_surface=True, plot_cell_qual=False):
             plotter.add_mesh(pv_data, "r", "wireframe")
             plotter.add_legend([[" Input Mesh ", "r"], [" Tessellated Mesh ", "black"]])
             plotter.show()
+
+
+
+def parse_visual_and_col_mesh_avatar(morph, surface):
+    path = get_asset_path(morph.file)
+    assert path.endswith('glb'), 'Only glb file is supported for avatar mesh.'
+    vm_infos = parse_mesh_avatar(path, morph.group_by_material, morph.scale)
+
+    # compute collision mesh
+    m_infos = list()
+    if morph.collision:
+        if morph.merge_submeshes_for_collision:
+            meshes = []
+            for vm_info in vm_infos:
+                meshes.append(trimesh.Trimesh(vm_info['vverts'], vm_info['vfaces'], vertex_normals=vm_info['vnormals'], process=False))
+            mesh = trimesh.util.concatenate(meshes)
+            verts, faces, normals = mesh.vertices, mesh.faces, mesh.vertex_normals
+
+            m_info = dict()
+            if morph.convexify:
+                verts, faces, normals = convexify(verts, faces, normals)
+                m_info['is_convex'] = True
+
+            if morph.decimate:
+                verts, faces, normals = decimate(verts, faces, normals, morph.decimate_face_num)
+                m_info['is_convex'] = False
+
+            edges = get_unique_edges(verts, faces)
+
+            m_info['verts']   = verts
+            m_info['faces']   = faces
+            m_info['edges']   = edges
+            m_info['normals'] = normals
+
+            m_infos.append(m_info)
+
+        else:
+            for vm_info in vm_infos:
+                m_info = dict()
+                verts, faces, normals = vm_info['vverts'], vm_info['vfaces'], vm_info['vnormals']
+
+                if morph.is_convex:
+                    verts, faces, normals = convexify(verts, faces, normals)
+                    m_info['is_convex'] = True
+
+                if morph.decimate:
+                    verts, faces, normals = decimate(verts, faces, normals, morph.decimate_face_num)
+                    m_info['is_convex'] = False
+
+                edges = get_unique_edges(verts, faces)
+
+                m_info['verts']   = verts
+                m_info['faces']   = faces
+                m_info['edges']   = edges
+                m_info['normals'] = normals
+
+                m_infos.append(m_info)
+
+    return vm_infos, m_infos
+
+
+def parse_mesh_avatar(path, group_by_material, scale):
+    glb = pygltflib.GLTF2().load(path)
+    assert glb is not None
+
+    def parse_tree(node_index):
+        node = glb.nodes[node_index]
+        if node.matrix is not None:
+            matrix = np.array(node.matrix, dtype=float).reshape((4, 4))
+        else:
+            matrix = np.identity(4, dtype=float)
+            if node.translation is not None:
+                translation = np.array(node.translation, dtype=float)
+                translation_matrix = np.identity(4, dtype=float)
+                translation_matrix[3, :3] = translation
+                matrix = translation_matrix @ matrix
+            if node.rotation is not None:
+                rotation = np.array(node.rotation, dtype=float)     # xyzw
+                rotation_matrix = np.identity(4, dtype=float)
+                rotation = [rotation[3], rotation[0], rotation[1], rotation[2]]
+                rotation_matrix[:3, :3] = trimesh.transformations.quaternion_matrix(rotation)[:3, :3].T
+                matrix = rotation_matrix @ matrix
+            if node.scale is not None:
+                scale = np.array(node.scale, dtype=float)
+                scale_matrix = np.diag(np.append(scale, 1))
+                matrix = scale_matrix @ matrix
+        mesh_list = list()
+        if node.mesh is not None:
+            mesh_list.append([node.mesh, np.identity(4, dtype=float)])
+        for sub_node_index in node.children:
+            sub_mesh_list = parse_tree(sub_node_index)
+            mesh_list.extend(sub_mesh_list)
+        for i in range(len(mesh_list)):
+            mesh_list[i][1] = mesh_list[i][1] @ matrix
+        return mesh_list
+
+    def get_bufferview_data(buffer_view):
+        buffer = glb.buffers[buffer_view.buffer]
+        return glb.get_data_from_buffer_uri(buffer.uri)
+
+    def get_data_from_accessor(accessor_index):
+        accessor = glb.accessors[accessor_index]
+        buffer_view = glb.bufferViews[accessor.bufferView]
+        buffer_data = get_bufferview_data(buffer_view)
+        data_type, data_ctype, data_count = accessor.type, accessor.componentType, accessor.count
+        data_length = data_count * type_to_count[data_type][0] * ctype_to_numpy[data_ctype][0]
+        data_start = buffer_view.byteOffset + accessor.byteOffset
+        return np.frombuffer(
+            buffer_data[data_start: data_start + data_length],
+            dtype=ctype_to_numpy[data_ctype][1],
+            count=data_count * type_to_count[data_type][0]
+        ).reshape([data_count] + type_to_count[data_type][1])
+
+    glb.convert_images(pygltflib.ImageFormat.DATAURI)
+
+    # binary_blob = glb.binary_blob()
+    scene = glb.scenes[glb.scene]
+
+    # for n in glb.nodes:
+    #     # set scale to None for speed up
+    #     n.scale = None
+    #     if n.translation is not None:
+    #         if "mixamo" in path:
+    #             n.translation = list(map(lambda x:x*0.01, n.translation))
+
+    mesh_list = list()
+    for node_index in scene.nodes:
+        root_mesh_list = parse_tree(node_index)
+        mesh_list.extend(root_mesh_list)
+
+    temp_infos = dict()
+    primitive_id = 0
+    for i in tqdm(range(len(mesh_list))):
+        mesh = glb.meshes[mesh_list[i][0]]
+        matrix = mesh_list[i][1]
+        for primitive in mesh.primitives:
+            if group_by_material:
+                group_idx = primitive.material
+            else:
+                group_idx = primitive_id
+
+            primitive_id += 1
+
+            if 'KHR_draco_mesh_compression' in primitive.extensions:
+                KHR_index = primitive.extensions['KHR_draco_mesh_compression']['bufferView']
+                mesh_buffer_view = glb.bufferViews[KHR_index]
+                mesh_data = get_bufferview_data(mesh_buffer_view)
+                mesh = DracoPy.decode(mesh_data[
+                                      mesh_buffer_view.byteOffset:
+                                      mesh_buffer_view.byteOffset + mesh_buffer_view.byteLength
+                                      ])
+                points = mesh.points
+                triangles = mesh.faces
+                normals = mesh.normals if len(mesh.normals) > 0 else None
+                uvs = mesh.tex_coord if len(mesh.tex_coord) > 0 else None
+
+            else:
+                # "primitive.attributes" records accessor indices in "glb.accessors", like:
+                #      Attributes(POSITION=2, NORMAL=1, TANGENT=None, TEXCOORD_0=None, TEXCOORD_1=None,
+                #                 COLOR_0=None, JOINTS_0=None, WEIGHTS_0=None)
+                # parse vertices
+                points = get_data_from_accessor(primitive.attributes.POSITION).astype(float)
+
+                # parse faces
+                triangles = get_data_from_accessor(primitive.indices).astype(np.int32).reshape(-1, 3)
+
+                # parse normals
+                if primitive.attributes.NORMAL:
+                    normals = get_data_from_accessor(primitive.attributes.NORMAL).astype(float)
+                else:
+                    normals = None
+
+                # parse uvs
+                if primitive.attributes.TEXCOORD_0:
+                    # and glb.materials[primitive.material].pbrMetallicRoughness.baseColorTexture is not None:
+                    # Roughness and metallic also need uvs
+                    uvs = get_data_from_accessor(primitive.attributes.TEXCOORD_0).astype(float)
+                else:
+                    uvs = None
+
+            # skinned vertices
+
+            # 1. parse joints
+            # - these arrays define the joints that affect each vertice
+            # - maximum 4 joints for each vertice
+            joints = get_data_from_accessor(primitive.attributes.JOINTS_0).reshape(-1, 4).astype(int)
+
+            # 2. parse weights
+            # - new transform matrix for each point is weighted sum of all related joints
+            weights = get_data_from_accessor(primitive.attributes.WEIGHTS_0).reshape(-1, 4).astype(float)
+
+            # 3. get skin parameters
+            # - joint order are defined in the skin_joints
+            skin = glb.skins[0]
+
+            # 5. parse global transform of joint nodes
+            global_transforms = np.asarray(
+                [it[1] for it in sorted(
+                    parse_global_transform(glb.nodes, scene.nodes[-1]),
+                    key=lambda x:x[0]
+                )]
+            )
+            globaljoint_mat = global_transforms[skin.joints]
+
+            # 6. get inverse transform
+            # invbindjoint_mat = np.array(
+            #     [np.matrix(globaljoint_mat[i]).I for i in range(globaljoint_mat.shape[0])]
+            # )
+            invbindjoint_mat = get_data_from_accessor(skin.inverseBindMatrices).reshape(-1, 4, 4).astype(float)
+
+            # 7. calculate skin mat for each points
+            skin_mat = invbindjoint_mat @ globaljoint_mat
+            skin_mat = (
+                    weights * skin_mat[joints].transpose(2,3,0,1)
+            ).transpose(2,3,0,1).sum(axis=1)
+
+            # 8. transform points
+            points_homo = np.append(points, np.ones((points.shape[0], 1)), axis=-1)[:,None]
+            points = (points_homo @ skin_mat)[:,0,:3]
+            normals_homo = np.append(normals, np.ones((normals.shape[0], 1)), axis=-1)[:,None]
+            normals = (normals_homo @ skin_mat)[:,0,:3]
+
+            matrix /= np.abs(matrix).max(axis=-1)
+            # matrix = matrix * np.abs(np.diag(1 / matrix.diagonal()))
+
+            if normals is None:
+                normals = trimesh.Trimesh(points, triangles, process=False).vertex_normals
+            points, normals = apply_transform(matrix, points, normals)
+
+            if group_idx not in temp_infos.keys():
+                temp_infos[group_idx] = {
+                    'mat_index' : primitive.material,
+                    'points'    : [points],
+                    'triangles' : [triangles],
+                    'normals'   : [normals],
+                    'uvs'       : [uvs],
+                    'n_points'  : len(points),
+                    'init_matrix'  : [matrix],
+                    'vert_joints'  : [joints],
+                    'vert_invbind' : [invbindjoint_mat],
+                    'vert_weights' : [weights],
+                    'skin_joints'  : [np.asarray(skin.joints)],
+                    'nodes'        : [[scene.nodes[-1], glb.nodes]]
+                }
+            else:
+                triangles += temp_infos[group_idx]['n_points']
+                temp_infos[group_idx]['points'].append(points)
+                temp_infos[group_idx]['triangles'].append(triangles)
+                temp_infos[group_idx]['normals'].append(normals)
+                temp_infos[group_idx]['uvs'].append(uvs)
+                temp_infos[group_idx]['n_points'] += len(points)
+                temp_infos[group_idx]['init_matrix'].append(matrix)
+                temp_infos[group_idx]['vert_joints'].append(joints)
+                temp_infos[group_idx]['vert_invbind'].append(invbindjoint_mat)
+                temp_infos[group_idx]['vert_weights'].append(weights)
+                temp_infos[group_idx]['skin_joints'].append(np.asarray(skin.joints))
+                temp_infos[group_idx]['nodes'].append([scene.nodes[-1], glb.nodes])
+
+    infos = list()
+    for group_idx in temp_infos.keys():
+        # parse images
+        color           = None
+        color_image     = None
+        # metallic_image  = None
+        # roughness_image = None
+
+        if temp_infos[group_idx]['mat_index'] is not None:
+            material = glb.materials[temp_infos[group_idx]['mat_index']]
+
+            if material.pbrMetallicRoughness is not None:
+                # Check if material has a base color texture
+                if material.pbrMetallicRoughness.baseColorTexture is not None:
+                    texture = glb.textures[material.pbrMetallicRoughness.baseColorTexture.index]
+                    image_index = texture.source
+                    image_data = uri_to_PIL(glb.images[image_index].uri)
+                    color_image = Image.open(image_data).convert("RGBA")
+
+                # parse color
+                if material.pbrMetallicRoughness.baseColorFactor is not None:
+                    color_factor = material.pbrMetallicRoughness.baseColorFactor
+                    color_factor = np.array(color_factor, dtype=float)
+
+                    if color_image is not None:
+                        bands = color_image.split()
+                        color_image = Image.merge("RGBA", [
+                            Image.eval(bands[i], lambda x: x * color_factor[i]) for i in range(4)
+                        ])
+                    else:
+                        color = color_factor
+
+        elif 'KHR_materials_pbrSpecularGlossiness' in material.extensions:
+            extension_material = material.extensions['KHR_materials_pbrSpecularGlossiness']
+            if 'diffuseTexture' in extension_material:
+                color_image = Image.open(uri_to_PIL(glb.images[extension_material['diffuseTexture']['index']].uri)).convert("RGBA")
+
+                if 'diffuseFactor' in extension_material:
+                    color_factor = np.array(extension_material['diffuseFactor'], dtype=float)
+                    if color_image is not None:
+                        bands = color_image.split()
+                        color_image = Image.merge("RGBA", [
+                            Image.eval(bands[i], lambda x: x * color_factor[i]) for i in range(4)
+                        ])
+                    else:
+                        color = color_factor
+
+        if color_image is not None:
+            image = np.array(color_image)
+        else:
+            image = None
+
+        # repair uv
+        group_uvs = temp_infos[group_idx]['uvs']
+        group_points = temp_infos[group_idx]['points']
+        member_count = len(group_points)
+        group_uv_exist = False
+
+        for i in range(member_count):
+            if group_uvs[i] is not None:
+                group_uv_exist = True
+
+        if group_uv_exist:
+            for i in range(member_count):
+                num_points = group_points[i].shape[0]
+                if group_uvs[i] is None:
+                    group_uvs[i] = np.zeros((num_points, 2), dtype=float)
+            uvs = np.concatenate(group_uvs)
+        else:
+            uvs = None
+
+        # build other group properties
+        vverts   = np.concatenate(temp_infos[group_idx]['points'])
+        vnormals = np.concatenate(temp_infos[group_idx]['normals'])
+        vfaces   = np.concatenate(temp_infos[group_idx]['triangles'])
+
+        vverts *= scale
+
+        init_matrix  = np.concatenate(temp_infos[group_idx]['init_matrix'])
+        vert_joints  = np.concatenate(temp_infos[group_idx]['vert_joints'])
+        vert_invbind = np.concatenate(temp_infos[group_idx]['vert_invbind'])
+        vert_weights = np.concatenate(temp_infos[group_idx]['vert_weights'])
+        skin_joints  = np.concatenate(temp_infos[group_idx]['skin_joints'])
+        nodes  = temp_infos[group_idx]['nodes'][0]
+
+        return_info = {
+            'vverts'   : vverts,
+            'vfaces'   : vfaces,
+            'vnormals' : vnormals,
+            'color'    : color,
+            'image'    : image,
+            'uvs'      : uvs,
+            'init_matrix'  : init_matrix,
+            'vert_joints'  : vert_joints,
+            'vert_invbind' : vert_invbind,
+            'vert_weights' : vert_weights,
+            'skin_joints'  : skin_joints,
+            'nodes'        : nodes
+            }
+        infos.append(return_info)
+
+    return infos
+
+
+def parse_global_transform(nodes, node_index, root_matrix=None):
+    matrix_list = list()
+    node = nodes[node_index]
+    matrix = parse_matrix(nodes, node_index)
+
+    if root_matrix is not None:
+        matrix = matrix @ root_matrix
+
+    matrix_list.append([node_index, matrix])
+
+    for sub_node_index in node.children:
+        sub_matrix_list = parse_global_transform(nodes, sub_node_index, matrix)
+        matrix_list.extend(sub_matrix_list)
+
+    return matrix_list
+
+def parse_matrix(nodes, node_index):
+    node = nodes[node_index]
+    if node.matrix is not None:
+        matrix = np.array(node.matrix, dtype=float).reshape((4, 4))
+    else:
+        matrix = np.identity(4, dtype=float)
+        scale_matrix, rotation_matrix, translation_matrix = \
+            np.identity(4), np.identity(4), np.identity(4)
+        if node.translation is not None:
+            translation = np.array(node.translation, dtype=float)
+            translation_matrix = np.identity(4, dtype=float)
+            translation_matrix[3, :3] = translation
+        if node.rotation is not None:
+            rotation = np.array(node.rotation, dtype=float)     # xyzw
+            rotation_matrix = np.identity(4, dtype=float)
+            rotation = [rotation[3], rotation[0], rotation[1], rotation[2]]
+            rotation_matrix[:3, :3] = trimesh.transformations.quaternion_matrix(rotation)[:3, :3].T
+        if node.scale is not None:
+            scale = np.array(node.scale, dtype=float)
+            scale_matrix = np.diag(np.append(scale, 1))
+        if node.name == "mixamorig:Hips":
+            matrix = scale_matrix @ rotation_matrix @ translation_matrix
+        else:
+            matrix = scale_matrix @ rotation_matrix @ translation_matrix
+    return matrix

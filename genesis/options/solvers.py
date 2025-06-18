@@ -240,7 +240,7 @@ class RigidOptions(Options):
         super().__init__(**data)
 
 
-class AvatarOptions(Options):
+class AvatarOptions(RigidOptions):
     """
     Options configuring the AvatarSolver. AvatarEntity is similar to RigidEntity, but without internal physics.
 
@@ -269,9 +269,17 @@ class AvatarOptions(Options):
     max_collision_pairs: int = 300
     IK_max_targets: int = 6  # Increasing this doesn't affect IK solving speed, but will increase memory usage
 
+    batch_links_info: Optional[bool] = False
+    batch_joints_info: Optional[bool] = False
+    batch_dofs_info: Optional[bool] = False
     # for dynamic properties
     max_dynamic_constraints: int = 8
 
+
+    # hibernation threshold
+    use_hibernation        : bool  = False
+    hibernation_thresh_vel : float = 1e-3
+    hibernation_thresh_acc : float = 1e-2
 
 class MPMOptions(Options):
     """

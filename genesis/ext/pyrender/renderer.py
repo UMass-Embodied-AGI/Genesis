@@ -139,6 +139,9 @@ class Renderer(object):
             If :attr:`RenderFlags.OFFSCREEN` is set, the depth buffer
             in linear units.
         """
+        # Create skybox
+        self.set_skybox(scene)
+
         # Update context with meshes and textures
         if is_first_pass:
             self._update_context(scene, flags)
@@ -464,6 +467,84 @@ class Renderer(object):
             self.delete()
         except Exception:
             pass
+
+    def set_skybox(self, scene, euler=(0,0,180)):
+        if hasattr(self, "skybox_nodes"):
+            return
+        import os
+        import cv2
+        from trimesh import Trimesh
+        from trimesh.visual.texture import TextureVisuals
+        from .texture import Texture
+        from .mesh import Mesh
+        from .node import Node
+        import genesis as gs
+        import genesis.utils.geom as geom_utils
+        vertices = np.array([
+            [-1, -1,  1],  # 0
+            [-1, -1, -1],  # 1
+            [-1,  1,  1],  # 2
+            [-1,  1, -1],  # 3
+            [ 1, -1,  1],  # 4
+            [ 1, -1, -1],  # 5
+            [ 1,  1,  1],  # 6
+            [ 1,  1, -1]   # 7
+        ])*10000
+        vertices = vertices @ geom_utils.euler_to_R(euler)
+
+        faces = np.array([
+            [1, 0, 2, 3],  # Front
+            [3, 2, 6, 7],  # Right side
+            [7, 6, 4, 5],  # Back
+            [5, 4, 0, 1],  # Left side
+            [5, 1, 3, 7],  # Top
+            [6, 2, 0, 4]   # Bottom
+        ], dtype=np.int32)
+
+        cube_map_filenames = ["Back", "Right", "Front", "Left", "Bottom", "Top"]
+        textures = []
+        for i in cube_map_filenames:
+            source_img = cv2.cvtColor(cv2.imread(os.path.join(os.path.dirname(gs.__file__), "assets/textures/skybox/", "FluffballDay{}.hdr".format(i))), cv2.COLOR_BGR2RGB)
+            texture = Texture(source=source_img, source_channels='RGB')
+            textures.append(texture)
+
+        self.skybox_nodes = []
+        for i, face_indices in enumerate(faces):
+            vertices_face = vertices[face_indices]
+            mesh = Trimesh(vertices=vertices_face, faces=[[0,1,2],[2,3,0]], face_normals=[])
+            mesh.invert()
+            # print(mesh)
+            mat = MetallicRoughnessMaterial(
+                baseColorTexture=textures[i],
+                baseColorFactor=[1.0,1.0,1.0,1.0],
+                emissiveTexture=textures[i],
+                emissiveFactor=[1.0,1.0,1.0],
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+                alphaCutoff=0.5,
+                doubleSided=True,
+                wireframe=False,
+                smooth=True,
+                alphaMode="BLEND"
+            )
+
+            texture_image = np.ones((1, 1, 3), dtype=np.uint8) * 255
+            texture = TextureVisuals(
+                uv=[[4e-3,4e-3],[4e-3,1-4e-3],[1-4e-3,1-4e-3],[1-4e-3,4e-3]],
+                image=texture_image,
+            )
+
+            mesh.visual = texture
+
+            node = Node(mesh=Mesh.from_trimesh(mesh, material=mat), translation=(0, 0, 0))
+            scene.add_node(node)
+            self.skybox_nodes.append(node)
+
+    def update_skybox(self, scene, camera_pose):
+        for node in self.skybox_nodes:
+            new_pose = np.eye(4)
+            new_pose[:3,-1] = camera_pose
+            scene.set_pose(node, new_pose)
 
     ###########################################################################
     # Rendering passes
@@ -982,6 +1063,9 @@ class Renderer(object):
         elif flags & RenderFlags.SEG:
             vertex_shader = "segmentation.vert"
             fragment_shader = "segmentation.frag"
+            if primitive.double_sided:
+                geometry_shader = "mesh_double_sided.geom"
+                defines["DOUBLE_SIDED"] = 1
         else:
             vertex_shader = "mesh_depth.vert"
             fragment_shader = "mesh_depth.frag"

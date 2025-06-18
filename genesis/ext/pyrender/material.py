@@ -418,7 +418,10 @@ class MetallicRoughnessMaterial(Material):
 
     @baseColorTexture.setter
     def baseColorTexture(self, value):
-        self._baseColorTexture = self._format_texture(value, "RGBA")
+        if isinstance(value, np.ndarray) and value.shape[2] == 4:
+            self._baseColorTexture = self._format_texture(value, 'RGBA')
+        else:
+            self._baseColorTexture = self._format_texture(value, 'RGB')
         self._tex_flags = None
 
     @property

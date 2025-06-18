@@ -190,7 +190,7 @@ class Simulator(RBC):
             solver.build()
             if solver.is_active():
                 self._active_solvers.append(solver)
-                if not isinstance(solver, RigidSolver):
+                if not isinstance(solver, (RigidSolver, AvatarSolver)):
                     self._rigid_only = False
         self._coupler.build()
 
@@ -250,9 +250,15 @@ class Simulator(RBC):
 
     def step(self, in_backward=False):
         if self._rigid_only:  # "Only Advance!" --Thomas Wade :P
-            for _ in range(self._substeps):
-                self.rigid_solver.substep()
-                self._cur_substep_global += 1
+            if self.rigid_solver.is_active():
+                for _ in range(self._substeps):
+                    self.rigid_solver.substep()
+                    self._cur_substep_global += 1
+
+            if self.avatar_solver.is_active():
+                self.avatar_solver.substep()
+                self._cur_substep_global += self._substeps
+
 
         else:
             self.process_input(in_backward=in_backward)

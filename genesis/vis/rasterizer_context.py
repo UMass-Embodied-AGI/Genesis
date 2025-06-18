@@ -815,6 +815,27 @@ class RasterizerContext:
         # render node to seg_idxc_rgb
         self.seg_node_map = dict()
         seg_idxc_max = 0
+        if self.sim.avatar_solver.is_active():
+            for avatar_entity in self.sim.avatar_solver.entities:
+                if avatar_entity.surface.vis_mode == 'visual':
+                    geoms = avatar_entity.vgeoms
+                else:
+                    geoms = avatar_entity.geoms
+
+                for geom in geoms:
+                    seg_idx = None
+                    if self.segmentation_level == 'geom':
+                        seg_idx = geom.idx
+                        assert False, 'geom level segmentation not supported yet'
+                    elif self.segmentation_level == 'link':
+                        seg_idx = geom.link.idx
+                    elif self.segmentation_level == 'entity':
+                        seg_idx = geom.entity.idx
+                    else:
+                        gs.raise_exception(f'Unsupported segmentation level: {self.segmentation_level}')
+                    seg_idxc = self.seg_idx_to_idxc(seg_idx)
+                    self.seg_node_map[self.rigid_nodes[geom.uid]] = self.seg_idxc_to_idxc_rgb(seg_idxc)
+                    seg_idxc_max = max(seg_idxc_max, seg_idxc)
         if self.sim.rigid_solver.is_active():
             for rigid_entity in self.sim.rigid_solver.entities:
                 if rigid_entity.surface.vis_mode == "visual":
