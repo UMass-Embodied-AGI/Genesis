@@ -92,8 +92,12 @@ class AvatarSolverState:
         self.dofs_vel = gs.zeros(scene.sim.avatar_solver._batch_shape(scene.sim.avatar_solver.n_dofs, True), **args)
 
         n_links = scene.sim.avatar_solver.n_links
+        n_geoms = scene.sim.rigid_solver.n_geoms
         self.links_pos = gs.zeros(scene.sim.avatar_solver._batch_shape((n_links, 3), True), **args)
         self.links_quat = gs.zeros(scene.sim.avatar_solver._batch_shape((n_links, 4), True), **args)
+        self.i_pos_shift = gs.zeros(scene.sim.avatar_solver._batch_shape((n_links, 3), True), **args)
+        self.mass_shift = gs.zeros(scene.sim.avatar_solver._batch_shape(n_links, True), **args)
+        self.friction_ratio = gs.ones(scene.sim.avatar_solver._batch_shape(n_geoms, True), **args)
 
     def serializable(self):
         self.scene = None

@@ -67,7 +67,7 @@ class Camera(RBC):
         spp=256,
         denoise=True,
         near=0.05,
-        far=100.0,
+        far=16000.0, # 100.0,  todo: move skybox to use smaller far
         transform=None,
     ):
         self._idx = idx

@@ -145,11 +145,9 @@ class AvatarLink(RBC):
                 else: # TODO: handle non-watertight mesh
                     self._inertial_mass = 1.0
 
+        # Postpone computation of inverse weight if not specified
         if self._invweight is None:
-            if self._inertial_mass > 0:
-                self._invweight = 1.0 / self.inertial_mass
-            else:
-                self._invweight = np.inf
+            self._invweight = np.full((2,), fill_value=-1.0, dtype=gs.np_float)
 
         # compute inertia using all geoms/vgeoms
         if self._inertial_i is None:
@@ -188,7 +186,7 @@ class AvatarLink(RBC):
 
         # override invweight if fixed
         if is_fixed:
-            self._invweight = 0.0
+            self._invweight = np.zeros((2,), dtype=gs.np_float)
 
 
     def _get_init_composed_mesh(self):
@@ -329,6 +327,33 @@ class AvatarLink(RBC):
         AABB = np.concatenate([verts.min(axis=-2, keepdims=True), verts.max(axis=-2, keepdims=True)], axis=-2)
         return AABB
 
+    @gs.assert_built
+    def set_mass(self, mass):
+        """
+		Set the mass of the link.
+		"""
+        if mass <= 0:
+            if mass < 0:
+                gs.raise_exception(f"Attempt to set mass of {mass} to {self.name} link. Mass must be positive.")
+            gs.logger.warning(f"Attempt to set mass of {mass} to {self.name} link. Mass must be positive, skipping.")
+            return
+
+        ratio = mass / self._inertial_mass
+        assert ratio > 0
+        self._inertial_mass *= ratio
+        if self._invweight is not None:
+            self._invweight /= ratio
+        self._inertial_i *= ratio
+
+        self._solver._kernel_adjust_link_inertia(self.idx, ratio)
+
+    @gs.assert_built
+    def get_mass(self):
+        """
+		Get the mass of the link.
+		"""
+        return self.inertial_mass
+
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
@@ -398,6 +423,11 @@ class AvatarLink(RBC):
 
     @property
     def invweight(self):
+        """
+		The invweight of the link.
+		"""
+        if self._invweight is None:
+            self._invweight = self._solver.get_links_invweight([self._idx]).cpu().numpy()[..., 0, :]
         return self._invweight
 
     @property

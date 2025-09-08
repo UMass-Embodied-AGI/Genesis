@@ -690,6 +690,8 @@ def R_to_T(R):
     else:
         gs.raise_exception(f"the input must be either torch.Tensor or np.ndarray. got: {type(R)=}")
 
+def R_to_ypr(R):
+    return Rotation.from_matrix(R).as_euler('zyx').astype(R.dtype)
 
 def quat_to_T(quat):
     if isinstance(quat, torch.Tensor):

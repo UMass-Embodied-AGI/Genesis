@@ -481,7 +481,7 @@ void main()
 #ifdef HAS_EMISSIVE_TEX
     emissive *= srgb_to_linear(texture(material.emissive_texture, uv_0)).rgb;
 #endif
-    color.xyz += emissive * material.emissive_factor;
+    color.xyz = color.xyz * (1-material.emissive_factor) + emissive;
 
     vec3 floor_color = floor_flag != 0 ? texture(floor_tex, gl_FragCoord.xy/screen_size).rgb : vec3(0.0);
 

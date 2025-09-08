@@ -387,11 +387,13 @@ class RasterizerContext:
 
                 for geom in geoms:
                     geom_T = geoms_T[geom.idx]
-                    node = self._scene.get_buffer_id(self.rigid_nodes[geom.uid], "model")
+                    node = self.rigid_nodes[geom.uid]
                     node.mesh._bounds = None
                     for primitive in node.mesh.primitives:
                         primitive.poses = geom_T
-                    buffer_updates[node] = geom_T.transpose((0, 2, 1))
+                    buffer_updates[self._scene.get_buffer_id(node, "model")] = geom_T.transpose((0, 2, 1))
+                    if hasattr(geom, "vverts"):
+                        buffer_updates[self._scene.get_buffer_id(node, 'pos')] = geom.vverts
 
     def on_mpm(self):
         if self.sim.mpm_solver.is_active():

@@ -312,7 +312,7 @@ def parse_usd_material(material, surface, zipfiles):
 def parse_mesh_usd(path, group_by_material, scale, surface):
     zipfiles = Usd.ZipFile.Open(path) if path.endswith(".usdz") else None
     stage = Usd.Stage.Open(path)
-    scale *= UsdGeom.GetStageMetersPerUnit(stage)
+    scale = list(np.array(scale) * UsdGeom.GetStageMetersPerUnit(stage))
     yup = UsdGeom.GetStageUpAxis(stage) == "Y"
     xform_cache = UsdGeom.XformCache()
 
