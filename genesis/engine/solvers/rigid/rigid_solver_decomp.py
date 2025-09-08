@@ -1064,6 +1064,7 @@ class RigidSolver(Solver):
             links_state=self.links_state,
             rigid_global_info=self._rigid_global_info,
             static_rigid_sim_config=self._static_rigid_sim_config,
+            static_rigid_sim_cache_key=self._static_rigid_sim_cache_key,
         )
 
     # TODO: we need to use a kernel to clear the constraints if hibernation is enabled

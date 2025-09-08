@@ -3,7 +3,7 @@ import gstaichi as ti
 import genesis as gs
 from genesis.engine.states.solvers import AvatarSolverState
 
-from .rigid.rigid_solver_decomp import RigidSolver
+from .rigid.rigid_solver_decomp import RigidSolver, kernel_get_state, func_forward_kinematics, func_integrate, func_update_geoms
 from .base_solver import Solver
 # Minimum ratio between simulation timestep `_substep_dt` and time constant of constraints
 TIME_CONSTANT_SAFETY_FACTOR = 2.0
@@ -44,9 +44,9 @@ class AvatarSolver(RigidSolver):
         self._hibernation_thresh_acc = options.hibernation_thresh_acc
 
         self._sol_min_timeconst = TIME_CONSTANT_SAFETY_FACTOR * self._substep_dt
-        self._sol_global_timeconst = options.constraint_timeconst
+        self._sol_default_timeconst = max(options.constraint_timeconst, self._sol_min_timeconst)
+        
         if options.contact_resolve_time is not None:
-            self._sol_global_timeconst = options.contact_resolve_time
             gs.logger.warning(
                 "Rigid option 'contact_resolve_time' is deprecated and will be remove in future release. Please use "
                 "'constraint_timeconst' instead."
@@ -67,16 +67,49 @@ class AvatarSolver(RigidSolver):
 
     @ti.kernel
     def _kernel_step(self):
-        self._func_integrate()
+        func_integrate(
+            dofs_state=self.dofs_state,
+            links_info=self.links_info,
+            joints_info=self.joints_info,
+            rigid_global_info=self._rigid_global_info,
+            static_rigid_sim_config=self._static_rigid_sim_config,
+        )
         ti.loop_config(serialize=self._para_level < gs.PARA_LEVEL.ALL)
         for i_b in range(self._B):
-            self._func_forward_kinematics(i_b)
-            self._func_update_geoms(i_b)
+            func_forward_kinematics(i_b,
+                links_state=self.links_state,
+                links_info=self.links_info,
+                joints_state=self.joints_state,
+                joints_info=self.joints_info,
+                dofs_state=self.dofs_state,
+                dofs_info=self.dofs_info,
+                entities_info=self.entities_info,
+                rigid_global_info=self._rigid_global_info,
+                static_rigid_sim_config=self._static_rigid_sim_config,
+            )
+            func_update_geoms(i_b,
+                entities_info=self.entities_info,
+                geoms_info=self.geoms_info,
+                geoms_state=self.geoms_state,
+                links_state=self.links_state,
+                rigid_global_info=self._rigid_global_info,
+                static_rigid_sim_config=self._static_rigid_sim_config,
+            )
 
     @ti.kernel
     def _kernel_forward_kinematics_links_geoms(self, envs_idx: ti.types.ndarray()):
         for i_b in envs_idx:
-            self._func_forward_kinematics(i_b)
+            func_forward_kinematics(i_b,
+                links_state=self.links_state,
+                links_info=self.links_info,
+                joints_state=self.joints_state,
+                joints_info=self.joints_info,
+                dofs_state=self.dofs_state,
+                dofs_info=self.dofs_info,
+                entities_info=self.entities_info,
+                rigid_global_info=self._rigid_global_info,
+                static_rigid_sim_config=self._static_rigid_sim_config,
+            )
             self._func_update_geoms(i_b)
 
     @ti.func
@@ -87,16 +120,20 @@ class AvatarSolver(RigidSolver):
     def get_state(self, f):
         if self.is_active():
             state = AvatarSolverState(self.scene)
-            self._kernel_get_state(
-                state.qpos,
-                state.dofs_vel,
-                state.links_pos,
-                state.links_quat,
+            kernel_get_state(
+                qpos=state.qpos,
+                vel=state.dofs_vel,
+                links_pos=state.links_pos,
+                links_quat=state.links_quat,
+                i_pos_shift=state.i_pos_shift,
+                mass_shift=state.mass_shift,
+                friction_ratio=state.friction_ratio,
                 links_state=self.links_state,
                 dofs_state=self.dofs_state,
                 geoms_state=self.geoms_state,
                 rigid_global_info=self._rigid_global_info,
                 static_rigid_sim_config=self._static_rigid_sim_config,
+                static_rigid_sim_cache_key=self._static_rigid_sim_cache_key,
             )
         else:
             state = None

@@ -6,6 +6,7 @@ imgui.ini
 sftp-config.json
 *.mp4
 genesis/assets/terrain/
+genesis/assets/ViCo
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

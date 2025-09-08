@@ -16,7 +16,7 @@ import Imath
 
 import coacd
 import igl
-
+import pygltflib
 import genesis as gs
 
 from tqdm import tqdm
@@ -1322,19 +1322,6 @@ def create_box(extents=None, color=(1.0, 1.0, 1.0, 1.0), bounds=None, wireframe=
     mesh._cache.cache["face_normals"] = face_normals
 
     return mesh
-
-
-def create_plane(normal=(0.0, 0.0, 1.0), plane_size=(1e3, 1e3), tile_size=(1, 1), color=None):
-def convexify(verts, faces, normals):
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals, process=False)
-    if mesh.vertices.shape[0] > 3:
-        mesh = trimesh.convex.convex_hull(mesh)
-    return mesh.vertices.copy(), mesh.faces.copy(), mesh.vertex_normals.copy()
-
-def decimate(verts, faces, normals, target_face_num):
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals, process=False)
-    mesh = mesh.simplify_quadratic_decimation(target_face_num)
-    return mesh.vertices.copy(), mesh.faces.copy(), mesh.vertex_normals.copy()
 
 def get_unique_edges(vert: np.ndarray, face: np.ndarray) -> np.ndarray:
     '''

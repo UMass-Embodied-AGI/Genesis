@@ -1,7 +1,6 @@
 import copy
 import torch
 import numpy as np
-import taichi as ti
 import genesis as gs
 import trimesh
 import genesis.utils.mesh as mesh_utils
@@ -127,6 +126,7 @@ class AvatarVisGeom(RigidVisGeom):
             if uvs is None:
                 gs.raise_exception('Asset does not have original texture, thus missing uv info (or failed to load). Custom texture map is not allowed.')
             self._uvs = np.ascontiguousarray(uvs)
+        self._color = color if color is not None else (1.0, 1.0, 1.0, 1.0)
 
     def get_trimesh(self):
         '''

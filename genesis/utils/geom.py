@@ -4,6 +4,7 @@ import numpy as np
 import numba as nb
 import torch
 import torch.nn.functional as F
+from scipy.spatial.transform import Rotation
 
 import gstaichi as ti
 
@@ -1322,6 +1323,8 @@ def T_to_pos_lookat_up(T):
 def euler_to_quat(euler_xyz):
     return xyz_to_quat(np.asarray(euler_xyz), rpy=True, degrees=True)
 
+def R_to_ypr(R):
+    return Rotation.from_matrix(R).as_euler('zyx').astype(R.dtype)
 
 @nb.jit(nopython=True, cache=True)
 def _np_euler_to_R(rpy: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
