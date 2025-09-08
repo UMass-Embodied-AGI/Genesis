@@ -6,7 +6,7 @@ import genesis as gs
 import trimesh
 import genesis.utils.mesh as mesh_utils
 
-import taichi as ti
+import gstaichi as ti
 
 from ..rigid_entity import RigidGeom, RigidVisGeom
 @ti.data_oriented

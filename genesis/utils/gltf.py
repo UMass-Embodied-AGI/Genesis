@@ -3,13 +3,13 @@ from urllib import request
 import numpy as np
 import pygltflib
 import trimesh
-from scipy.spatial.transform import Rotation as R
 from PIL import Image
 
 import genesis as gs
 
 from tqdm import tqdm
 from . import mesh as mu
+from . import geom as gu
 
 
 ctype_to_numpy = {
@@ -77,6 +77,7 @@ def get_glb_data_from_accessor(glb, accessor_index):
             array[i] = np.frombuffer(data_slice, dtype=dtype, count=num_components)
 
     return array.reshape([count, *type_to_count[data_type][1]])
+
 
 def get_glb_image(glb, image_index, image_type=None):
     if image_index is not None:
@@ -230,8 +231,9 @@ def parse_glb_material(glb, material_index, surface):
         if material.emissiveFactor is not None:
             emissive_factor = np.array(material.emissiveFactor, dtype=np.float32)
 
-        if emissive_factor is not None and np.any(emissive_factor > 0.0):  # Make sure to check emissive
-            emissive_texture = mu.create_texture(emissive_image, emissive_factor, "srgb")
+        emissive_texture = mu.create_texture(emissive_image, emissive_factor, "srgb")
+        if emissive_texture.is_black():  # Make sure to check emissive
+            emissive_texture = None
 
     # TODO: Parse them!
     for extension_name, extension_material in material.extensions.items():
@@ -285,7 +287,8 @@ def parse_glb_tree(glb, node_index):
             transform[:3, 3] = node.translation
             non_identity = True
         if node.rotation is not None:
-            transform[:3, :3] = R.from_quat(node.rotation).as_matrix()  # xyzw
+            quat = np.array(node.rotation, dtype=np.float32)[[3, 0, 1, 2]]
+            gu.quat_to_R(quat, out=transform[:3, :3])
             non_identity = True
         if node.scale is not None:
             transform[:3, :3] *= node.scale
@@ -390,7 +393,7 @@ def parse_mesh_glb(path, group_by_material, scale, surface):
             if group_by_material:
                 group_idx = primitive.material
             else:
-                group_idx = i
+                material, uv_used, material_name = surface.copy(), 0, ""
 
             uvs0, uvs1 = None, None
             if "KHR_draco_mesh_compression" in primitive.extensions:

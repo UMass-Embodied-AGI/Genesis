@@ -1,13 +1,15 @@
 from typing import TYPE_CHECKING
 import numpy as np
-import taichi as ti
+import gstaichi as ti
 
 import genesis as gs
 from genesis.engine.entities.base_entity import Entity
 from genesis.options.morphs import Morph
 from genesis.options.solvers import (
     AvatarOptions,
-    CouplerOptions,
+    BaseCouplerOptions,
+    LegacyCouplerOptions,
+    SAPCouplerOptions,
     FEMOptions,
     MPMOptions,
     PBDOptions,
@@ -19,8 +21,8 @@ from genesis.options.solvers import (
 )
 from genesis.repr_base import RBC
 
-from .coupler import Coupler
 from .entities import HybridEntity
+from .solvers.base_solver import Solver
 from .solvers import (
     AvatarSolver,
     FEMSolver,
@@ -31,8 +33,10 @@ from .solvers import (
     SPHSolver,
     ToolSolver,
 )
+from .couplers import LegacyCoupler, SAPCoupler
 from .states.cache import QueriedStates
 from .states.solvers import SimState
+from genesis.sensors.sensor_manager import SensorManager
 
 if TYPE_CHECKING:
     from genesis.engine.scene import Scene
@@ -73,7 +77,7 @@ class Simulator(RBC):
         self,
         scene: "Scene",
         options: SimOptions,
-        coupler_options: CouplerOptions,
+        coupler_options: BaseCouplerOptions,
         tool_options: ToolOptions,
         rigid_options: RigidOptions,
         avatar_options: AvatarOptions,
@@ -97,15 +101,15 @@ class Simulator(RBC):
         self.sf_options = sf_options
         self.pbd_options = pbd_options
 
-        self._dt = options.dt
-        self._substep_dt = options.dt / options.substeps
-        self._substeps = options.substeps
-        self._substeps_local = options.substeps_local
-        self._requires_grad = options.requires_grad
-        self._steps_local = options._steps_local
+        self._dt: float = options.dt
+        self._substep_dt: float = options.dt / options.substeps
+        self._substeps: int = options.substeps
+        self._substeps_local: int | None = options.substeps_local
+        self._requires_grad: bool = options.requires_grad
+        self._steps_local: int | None = options._steps_local
 
         self._cur_substep_global = 0
-        self._gravity = np.array(options.gravity)
+        self._gravity = np.array(options.gravity, dtype=gs.np_float)
 
         # solvers
         self.tool_solver = ToolSolver(self.scene, self, self.tool_options)
@@ -133,13 +137,23 @@ class Simulator(RBC):
         self._active_solvers: list[Solver] = gs.List()
 
         # coupler
-        self._coupler = Coupler(self, self.coupler_options)
+        if isinstance(self.coupler_options, SAPCouplerOptions):
+            self._coupler = SAPCoupler(self, self.coupler_options)
+        elif isinstance(self.coupler_options, LegacyCouplerOptions):
+            self._coupler = LegacyCoupler(self, self.coupler_options)
+        else:
+            gs.raise_exception(
+                f"Coupler options {self.coupler_options} not supported. Please use SAPCouplerOptions or LegacyCouplerOptions."
+            )
 
         # states
         self._queried_states = QueriedStates()
 
         # entities
         self._entities: list[Entity] = gs.List()
+
+        # sensors
+        self._sensor_manager = SensorManager(self)
 
     def _add_entity(self, morph: Morph, material, surface, visualize_contact=False):
         if isinstance(material, gs.materials.Tool):
@@ -179,7 +193,6 @@ class Simulator(RBC):
             solver._add_force_field(force_field)
 
     def build(self):
-
         self.n_envs = self.scene.n_envs
         self._B = self.scene._B
         self._para_level = self.scene._para_level
@@ -197,17 +210,19 @@ class Simulator(RBC):
         if self.n_envs > 0 and self.sf_solver.is_active():
             gs.raise_exception("Batching is not supported for SF solver as of now.")
 
+        self._sensor_manager.build()
+
         # hybrid
         for entity in self._entities:
             if isinstance(entity, HybridEntity):
                 entity.build()
 
-    def reset(self, state, envs_idx=None):
+    def reset(self, state: SimState, envs_idx=None):
         for solver, solver_state in zip(self._solvers, state):
-            solver.set_state(0, solver_state, envs_idx)
+            if solver.n_entities > 0:
+                solver.set_state(0, solver_state, envs_idx)
 
-        # TODO: keeping as is for now, since coupler is currently for non-batched scenes
-        self.coupler.reset()
+        self.coupler.reset(envs_idx=envs_idx)
 
         # TODO: keeping as is for now
         self.reset_grad()
@@ -268,6 +283,11 @@ class Simulator(RBC):
                 self._cur_substep_global += 1
                 if self.cur_substep_local == 0 and not in_backward:
                     self.save_ckpt()
+
+        if self.rigid_solver.is_active():
+            self.rigid_solver.clear_external_force()
+
+        self._sensor_manager.step()
 
     def _step_grad(self):
         for _ in range(self._substeps - 1, -1, -1):
@@ -395,12 +415,17 @@ class Simulator(RBC):
 
         return state
 
+    def set_gravity(self, gravity, envs_idx=None):
+        for solver in self._solvers:
+            if solver.is_active():
+                solver.set_gravity(gravity, envs_idx)
+
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
 
     @property
-    def dt(self):
+    def dt(self) -> float:
         """The time duration for each simulation step."""
         return self._dt
 
@@ -425,7 +450,7 @@ class Simulator(RBC):
         return self._requires_grad
 
     @property
-    def n_entities(self):
+    def n_entities(self) -> int:
         """The number of entities in the simulator."""
         return len(self._entities)
 

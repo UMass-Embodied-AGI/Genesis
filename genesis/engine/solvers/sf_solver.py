@@ -1,6 +1,6 @@
 import math
 import numpy as np
-import taichi as ti
+import gstaichi as ti
 
 import genesis as gs
 import genesis.utils.geom as gu
@@ -41,6 +41,7 @@ class SFSolver(Solver):
         self.jets = jets
 
     def build(self):
+        super().build()
         if self.is_active():
             self.t = 0.0
             self.setup_fields()

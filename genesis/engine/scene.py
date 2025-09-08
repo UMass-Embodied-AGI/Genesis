@@ -1,18 +1,27 @@
 import os
+import pickle
+import sys
+import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+import gstaichi as ti
+from numpy.typing import ArrayLike
 
 import genesis as gs
 import genesis.utils.geom as gu
+from genesis.utils.misc import ALLOCATE_TENSOR_WARNING
 from genesis.engine.entities.base_entity import Entity
 from genesis.engine.force_fields import ForceField
 from genesis.engine.materials.base import Material
 from genesis.engine.entities import Emitter
+from genesis.engine.states.solvers import SimState
 from genesis.engine.simulator import Simulator
 from genesis.options import (
     AvatarOptions,
-    CouplerOptions,
+    BaseCouplerOptions,
+    LegacyCouplerOptions,
     FEMOptions,
     MPMOptions,
     PBDOptions,
@@ -27,12 +36,15 @@ from genesis.options import (
 )
 from genesis.options.morphs import Morph
 from genesis.options.surfaces import Surface
-from genesis.options.renderers import Rasterizer, Renderer
+from genesis.options.renderers import Rasterizer, RendererOptions
 from genesis.repr_base import RBC
 from genesis.utils.tools import FPSTracker
 from genesis.utils.misc import redirect_libc_stderr, tensor_to_array
 from genesis.vis import Visualizer
 from genesis.utils.warnings import warn_once
+
+if TYPE_CHECKING:
+    from genesis.sensors.base_sensor import SensorOptions
 
 
 @gs.assert_initialized
@@ -67,8 +79,8 @@ class Scene(RBC):
         The options configuring the visualization system (``scene.visualizer``). Visualizer controls both the interactive viewer and the cameras.
     viewer_options : gs.options.ViewerOptions
         The options configuring the viewer (``scene.visualizer.viewer``).
-    renderer : gs.renderers.Renderer
-        The renderer used by `camera` for rendering images. This doesn't affect the behavior of the interactive viewer.
+    renderer : gs.renderers.RendererOptions
+        The renderer options used by `camera` for rendering images. This doesn't affect the behavior of the interactive viewer.
     show_viewer : bool
         Whether to show the interactive viewer. Set it to False if you only need headless rendering.
     show_FPS : bool
@@ -78,7 +90,7 @@ class Scene(RBC):
     def __init__(
         self,
         sim_options: SimOptions | None = None,
-        coupler_options: CouplerOptions | None = None,
+        coupler_options: BaseCouplerOptions | None = None,
         tool_options: ToolOptions | None = None,
         rigid_options: RigidOptions | None = None,
         avatar_options: AvatarOptions | None = None,
@@ -90,13 +102,13 @@ class Scene(RBC):
         vis_options: VisOptions | None = None,
         viewer_options: ViewerOptions | None = None,
         profiling_options: ProfilingOptions | None = None,
-        renderer: Renderer | None = None,
+        renderer: RendererOptions | None = None,
         show_viewer: bool | None = None,
         show_FPS: bool | None = None,  # deprecated, use profiling_options.show_FPS instead
     ):
         # Handling of default arguments
         sim_options = sim_options or SimOptions()
-        coupler_options = coupler_options or CouplerOptions()
+        coupler_options = coupler_options or LegacyCouplerOptions()
         tool_options = tool_options or ToolOptions()
         rigid_options = rigid_options or RigidOptions()
         avatar_options = avatar_options or AvatarOptions()
@@ -146,6 +158,7 @@ class Scene(RBC):
 
         self.vis_options = vis_options
         self.viewer_options = viewer_options
+        self.renderer_options = renderer
 
         # merge options
         self.tool_options.copy_attributes_from(self.sim_options)
@@ -178,7 +191,7 @@ class Scene(RBC):
             show_viewer=show_viewer,
             vis_options=vis_options,
             viewer_options=viewer_options,
-            renderer=renderer,
+            renderer_options=renderer,
         )
 
         # emitters
@@ -193,10 +206,15 @@ class Scene(RBC):
 
         gs.logger.info(f"Scene ~~~<{self._uid}>~~~ created.")
 
+    def __del__(self):
+        if self._visualizer is not None:
+            self._visualizer.destroy()
+            self._visualizer = None
+
     def _validate_options(
         self,
         sim_options: SimOptions,
-        coupler_options: CouplerOptions,
+        coupler_options: BaseCouplerOptions,
         tool_options: ToolOptions,
         rigid_options: RigidOptions,
         avatar_options: AvatarOptions,
@@ -208,13 +226,13 @@ class Scene(RBC):
         vis_options: VisOptions,
         viewer_options: ViewerOptions,
         profiling_options: ProfilingOptions,
-        renderer: Renderer,
+        renderer_options: RendererOptions,
     ):
         if not isinstance(sim_options, SimOptions):
             gs.raise_exception("`sim_options` should be an instance of `SimOptions`.")
 
-        if not isinstance(coupler_options, CouplerOptions):
-            gs.raise_exception("`coupler_options` should be an instance of `CouplerOptions`.")
+        if not isinstance(coupler_options, BaseCouplerOptions):
+            gs.raise_exception("`coupler_options` should be an instance of `BaseCouplerOptions`.")
 
         if not isinstance(tool_options, ToolOptions):
             gs.raise_exception("`tool_options` should be an instance of `ToolOptions`.")
@@ -249,7 +267,7 @@ class Scene(RBC):
         if not isinstance(profiling_options, ProfilingOptions):
             gs.raise_exception("`profiling_options` should be an instance of `ProfilingOptions`.")
 
-        if not isinstance(renderer, Renderer):
+        if not isinstance(renderer_options, RendererOptions):
             gs.raise_exception("`renderer` should be an instance of `gs.renderers.Renderer`.")
 
     @gs.assert_unbuilt
@@ -286,9 +304,8 @@ class Scene(RBC):
             material = gs.materials.Rigid()
 
         if surface is None:
-            surface = (
-                gs.surfaces.Default()
-            )  # assign a local surface, otherwise modification will apply on global default surface
+            # assign a local surface, otherwise modification will apply on global default surface
+            surface = gs.surfaces.Default()
 
         if isinstance(material, gs.materials.Rigid):
             # small sdf res is sufficient for primitives regardless of size
@@ -316,7 +333,7 @@ class Scene(RBC):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
-            if surface.vis_mode not in ["visual", "collision", "sdf"]:
+            if surface.vis_mode not in ("visual", "collision", "sdf"):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual', 'collision', 'sdf']."
                 )
@@ -335,7 +352,7 @@ class Scene(RBC):
             if surface.vis_mode is None:
                 surface.vis_mode = "particle"
 
-            if surface.vis_mode not in ["particle", "recon"]:
+            if surface.vis_mode not in ("particle", "recon"):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
                 )
@@ -353,7 +370,7 @@ class Scene(RBC):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
-            if surface.vis_mode not in ["visual", "particle", "recon"]:
+            if surface.vis_mode not in ("visual", "particle", "recon"):
                 gs.raise_exception(
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual', 'particle', 'recon']."
                 )
@@ -427,23 +444,24 @@ class Scene(RBC):
 
         if child_link._parent_idx != -1:
             gs.logger.warning(
-                "Child entity already has a parent link. This may cause the entity to break into parts. Make sure this operation is intended."
+                "Child entity already has a parent link. This may cause the entity to break into parts. Make sure "
+                "this operation is intended."
             )
         child_link._parent_idx = parent_link.idx
         parent_link._child_idxs.append(child_link.idx)
 
     @gs.assert_unbuilt
-    def add_light(
+    def add_mesh_light(
         self,
-        morph: Morph,
-        color=(1.0, 1.0, 1.0, 1.0),
-        intensity=20.0,
-        revert_dir=False,
-        double_sided=False,
-        beam_angle=180.0,
+        morph: Morph | None = None,
+        color: ArrayLike | None = (1.0, 1.0, 1.0, 1.0),
+        intensity: float = 20.0,
+        revert_dir: bool | None = False,
+        double_sided: bool | None = False,
+        cutoff: float | None = 180.0,
     ):
         """
-        Add a light to the scene. Note that lights added this way can be instantiated from morphs (supporting `gs.morphs.Primitive` or `gs.morphs.Mesh`), and will only be used by the RayTracer renderer.
+        Add a mesh light to the scene. Only supported by RayTracer.
 
         Parameters
         ----------
@@ -457,20 +475,74 @@ class Scene(RBC):
             Whether to revert the direction of the light. If True, the light will be emitted towards the mesh's inside.
         double_sided : bool
             Whether to emit light from both sides of surface.
-        beam_angle : float
-            The beam angle of the light.
+        cutoff : float
+            The cutoff angle of the light in degrees. Range: [0.0, 180.0].
         """
-        if self.visualizer.raytracer is None:
-            gs.logger.warning("Light is only supported by RayTracer renderer.")
-            return
+        if not isinstance(self.renderer_options, gs.renderers.RayTracer):
+            if isinstance(self.renderer_options, gs.renderers.BatchRenderer):
+                gs.raise_exception(
+                    "This method is only supported by RayTracer. Please use 'add_light' when using BatchRenderer."
+                )
+            else:
+                gs.raise_exception(
+                    "This method is only supported by RayTracer. Impossible to add light when using Rasterizer."
+                )
 
         if not isinstance(morph, (gs.morphs.Primitive, gs.morphs.Mesh)):
             gs.raise_exception("Light morph only supports `gs.morphs.Primitive` or `gs.morphs.Mesh`.")
-
         mesh = gs.Mesh.from_morph_surface(morph, gs.surfaces.Plastic(smooth=False))
-        self.visualizer.raytracer.add_mesh_light(
-            mesh, color, intensity, morph.pos, morph.quat, revert_dir, double_sided, beam_angle
-        )
+        self._visualizer.add_mesh_light(mesh, color, intensity, morph.pos, morph.quat, revert_dir, double_sided, cutoff)
+
+    @gs.assert_unbuilt
+    def add_light(
+        self,
+        pos: ArrayLike,
+        dir: ArrayLike,
+        color: ArrayLike = (1.0, 1.0, 1.0),
+        intensity: float = 1.0,
+        directional: bool = False,
+        castshadow: bool = True,
+        cutoff: float = 45.0,
+        attenuation: float = 0.0,
+    ):
+        """
+        Add a light to the scene for batch renderer.
+
+        Parameters
+        ----------
+        pos : tuple of float, shape (3,)
+            The position of the light, specified as (x, y, z).
+        dir : tuple of float, shape (3,)
+            The direction of the light, specified as (x, y, z).
+        color : tuple of float, shape (3,)
+            The color of the light, specified as (r, g, b).
+        intensity : float
+            The intensity of the light.
+        directional : bool
+            Whether the light is directional.
+        castshadow : bool
+            Whether the light casts shadows.
+        cutoff : float
+            The cutoff angle of the light in degrees. Range: (0.0, 90.0).
+        attenuation : float
+            The attenuation factor of the light.
+            Light intensity will attenuate by distance with (1 / (1 + attenuation * distance ^ 2))
+        """
+        if not isinstance(self.renderer_options, gs.renderers.BatchRenderer):
+            if isinstance(self.renderer_options, gs.renderers.BatchRenderer):
+                gs.raise_exception(
+                    "This method is only supported by BatchRenderer. Please use 'add_mesh_light' when using RayTracer."
+                )
+            else:
+                gs.raise_exception(
+                    "This method is only supported by BatchRenderer. Impossible to add light when using Rasterizer."
+                )
+
+        self.visualizer.add_light(pos, dir, color, intensity, directional, castshadow, cutoff, attenuation)
+
+    @gs.assert_unbuilt
+    def add_sensor(self, sensor_options: "SensorOptions"):
+        return self._sim._sensor_manager.create_sensor(sensor_options)
 
     @gs.assert_unbuilt
     def add_camera(
@@ -485,10 +557,22 @@ class Scene(RBC):
         focus_dist=None,
         GUI=False,
         spp=256,
-        denoise=True,
+        denoise=None,
+        near=0.1,
+        far=20.0,
+        env_idx=None,
+        debug=False,
     ):
         """
-        Add a camera to the scene. The camera model can be either 'pinhole' or 'thinlens'. The 'pinhole' model is a simple camera model that captures light rays from a single point in space. The 'thinlens' model is a more complex camera model that simulates a lens with a finite aperture size, allowing for depth of field effects. When 'pinhole' is used, the `aperture` and `focal_len` parameters are ignored.
+        Add a camera to the scene.
+
+        The camera model can be either 'pinhole' or 'thinlens'. The 'pinhole' model is a simple camera model that
+        captures light rays from a single point in space. The 'thinlens' model is a more complex camera model that
+        simulates a lens with a finite aperture size, allowing for depth of field effects.
+
+        Warning
+        -------
+        When 'pinhole' is used, the `aperture` and `focal_len` parameters are ignored.
 
         Parameters
         ----------
@@ -513,15 +597,38 @@ class Scene(RBC):
         spp : int, optional
             Samples per pixel. Only available when using RayTracer renderer. Defaults to 256.
         denoise : bool
-            Whether to denoise the camera's rendered image. Only available when using the RayTracer renderer.. Defaults to True. If OptiX denoiser is not available in your platform, consider enabling the OIDN denoiser option when building the RayTracer.
+            Whether to denoise the camera's rendered image. Only available when using the RayTracer renderer. Defaults
+            to True on Linux, otherwise False. If OptiX denoiser is not available in your platform, consider enabling
+            the OIDN denoiser option when building the RayTracer.
+        near : float
+            Distance from camera center to near plane in meters.
+            Only available when using rasterizer in Rasterizer and BatchRender renderer. Defaults to 0.1.
+        far : float
+            Distance from camera center to far plane in meters.
+            Only available when using rasterizer in Rasterizer and BatchRender renderer. Defaults to 20.0.
+        env_idx : int, optional
+            The specific environment index to bind to the camera. This option must be specified if and only if a
+            non-batched renderer is being used. If provided, only this environment will be taken into account when
+            following a rigid entity via 'follow_entity' and when being attached to some rigid link via 'attach'. Note
+            that this option is unrelated to which environment is being rendering on the scene. Default to None for
+            batched renderers (ie BatchRender), 'rendered_envs_idx[0]' otherwise (ie Raytracer or Rasterizer).
+        debug : bool
+            Whether to use the debug camera. It enables to create cameras that can used to monitor / debug the
+            simulation without being part of the "sensors". Their output is rendered by the usual simple Rasterizer
+            systematically, no matter if BatchRender and RayTracer is enabled. This way, it is possible to record the
+            simulation with arbitrary resolution and camera pose, without interfering with what robots can perceive
+            from their environment. Defaults to False.
 
         Returns
         -------
         camera : genesis.Camera
             The created camera object.
         """
-
-        return self._visualizer.add_camera(res, pos, lookat, up, model, fov, aperture, focus_dist, GUI, spp, denoise)
+        if denoise is None:
+            denoise = sys.platform != "darwin"
+        return self._visualizer.add_camera(
+            res, pos, lookat, up, model, fov, aperture, focus_dist, GUI, spp, denoise, near, far, env_idx, debug
+        )
 
     @gs.assert_unbuilt
     def add_emitter(
@@ -536,11 +643,13 @@ class Scene(RBC):
         Parameters
         ----------
         material : gs.materials.Material
-            The material of the fluid to be emitted. Must be an instance of `gs.materials.MPM.Base` or `gs.materials.SPH.Base`.
+            The material of the fluid to be emitted. Must be an instance of `gs.materials.MPM.Base`,
+            `gs.materials.SPH.Base`, `gs.materials.PBD.Particle` or `gs.materials.PBD.Liquid`.
         max_particles : int
-            The maximum number of particles that can be emitted by the emitter. Particles will be recycled once this limit is reached.
+            The maximum number of particles that can be emitted by the emitter. Particles will be recycled once this
+            limit is reached.
         surface : gs.surfaces.Surface | None, optional
-            The surface of the emitter. If None, use ``gs.surfaces.Default(color=(0.6, 0.8, 1.0, 1.0))``.
+            The surface of the emitter. If None, use `gs.surfaces.Default(color=(0.6, 0.8, 1.0, 1.0))`.
 
         Returns
         -------
@@ -555,11 +664,17 @@ class Scene(RBC):
             material, (gs.materials.MPM.Base, gs.materials.SPH.Base, gs.materials.PBD.Particle, gs.materials.PBD.Liquid)
         ):
             gs.raise_exception(
-                "Non-supported material for emitter. Supported materials are: `gs.materials.MPM.Base`, `gs.materials.SPH.Base`, `gs.materials.PBD.Particle`, `gs.materials.PBD.Liquid`."
+                "Non-supported material for emitter. Supported materials are: `gs.materials.MPM.Base`, "
+                "`gs.materials.SPH.Base`, `gs.materials.PBD.Particle`, `gs.materials.PBD.Liquid`."
             )
 
         if surface is None:
             surface = gs.surfaces.Default(color=(0.6, 0.8, 1.0, 1.0))
+
+        if surface.vis_mode is None:
+            surface.vis_mode = "particle"
+        if surface.vis_mode == "visual":
+            gs.raise_exception("surface.vis_mode='visual' is not supported for fluid emitters.")
 
         emitter = Emitter(max_particles)
         entity = self.add_entity(
@@ -662,13 +777,10 @@ class Scene(RBC):
         # compute offset values for visualizing each env
         if not isinstance(env_spacing, (list, tuple)) or len(env_spacing) != 2:
             gs.raise_exception("`env_spacing` should be a tuple of length 2.")
-        idx_x = np.floor(np.arange(self._B) / self.n_envs_per_row)
-        idx_y = np.arange(self._B) % self.n_envs_per_row
-        idx_z = np.arange(self._B)
-        offset_x = idx_x * self.env_spacing[0]
-        offset_y = idx_y * self.env_spacing[1]
-        offset_z = idx_z * 0.0
-        self.envs_offset = np.vstack([offset_x, offset_y, offset_z]).T
+        offset_x = (np.arange(self._B) // self.n_envs_per_row) * self.env_spacing[0]
+        offset_y = (np.arange(self._B) % self.n_envs_per_row) * self.env_spacing[1]
+        offset_z = np.zeros((self._B,))
+        self.envs_offset = np.stack((offset_x, offset_y, offset_z), axis=-1, dtype=gs.np_float)
 
         # move to center
         if center_envs_at_origin:
@@ -692,23 +804,27 @@ class Scene(RBC):
             self._para_level = gs.PARA_LEVEL.ALL
 
     @gs.assert_built
-    def reset(self, state: dict | None = None, envs_idx=None):
+    def reset(self, state: SimState | None = None, envs_idx=None):
         """
         Resets the scene to its initial state.
 
         Parameters
         ----------
-        state : dict | None
-            The state to reset the scene to. If None, the scene will be reset to its initial state. If this is given, the scene's registerered initial state will be updated to this state.
+        state : SimState | None
+            The state to reset the scene to. If None, the scene will be reset to its initial state.
+            If this is given, the scene's registerered initial state will be updated to this state.
+        envs_idx : None | array_like, optional
+            The indices of the environments. If None, all environments will be considered. Defaults to None.
         """
-        gs.logger.info(f"Resetting Scene ~~~<{self._uid}>~~~.")
-        self._reset(state, envs_idx)
+        gs.logger.debug(f"Resetting Scene ~~~<{self._uid}>~~~.")
+        self._reset(state, envs_idx=envs_idx)
 
-    def _reset(self, state=None, envs_idx=None):
+    def _reset(self, state: SimState | None = None, *, envs_idx=None):
         if self._is_built:
             if state is None:
                 state = self._init_state
             else:
+                assert isinstance(state, SimState), "state must be a SimState object"
                 self._init_state = state
             self._sim.reset(state, envs_idx)
         else:
@@ -718,7 +834,8 @@ class Scene(RBC):
         self._forward_ready = True
         self._reset_grad()
 
-        # TODO: sets _t = -1; not sure this is env isolation safe
+        # Clear the entire cache of the visualizer.
+        # TODO: Could be optimized to only clear cache associated the the environments being reset.
         self._visualizer.reset()
 
         # TODO: sets _next_particle = 0; not sure this is env isolation safe
@@ -998,7 +1115,8 @@ class Scene(RBC):
         density : float, optional
             Controls the sampling density of the trajectory points to visualize. Default is 0.3.
         frame_scaling : float, optional
-            Scaling factor for the visualization frames' size. Affects the length and thickness of the debug frames. Default is 1.0.
+            Scaling factor for the visualization frames' size. Affects the length and thickness of the debug frames.
+            Default is 1.0.
 
         Returns
         -------
@@ -1008,7 +1126,8 @@ class Scene(RBC):
         Notes
         -----
         The function uses forward kinematics (FK) to convert joint positions to Cartesian space and render debug frames.
-        The density parameter reduces FK computational load by sampling fewer points, with 1.0 representing the whole trajectory.
+        The density parameter reduces FK computational load by sampling fewer points, with 1.0 representing the whole
+        trajectory.
         """
         with self._visualizer.viewer_lock:
             N = len(qposs)
@@ -1024,6 +1143,50 @@ class Scene(RBC):
             return self._visualizer.context.draw_debug_frames(
                 Ts, axis_length=frame_scaling * 0.1, origin_size=0.001, axis_radius=frame_scaling * 0.005
             )
+
+    @gs.assert_built
+    def render_all_cameras(
+        self,
+        rgb=True,
+        depth=False,
+        segmentation=False,
+        colorize_seg=False,
+        normal=False,
+        antialiasing=False,
+        force_render=False,
+    ):
+        """
+        Render the scene for all cameras using the batch renderer.
+
+        Parameters
+        ----------
+        rgb : bool, optional
+            Whether to render the rgb image.
+        depth : bool, optional
+            Whether to render the depth image.
+        segmentation : bool, optional
+            Whether to render the segmentation image.
+        normal : bool, optional
+            Whether to render the normal image.
+        antialiasing : bool, optional
+            Whether to apply anti-aliasing.
+        force_render : bool, optional
+            Whether to force render the scene.
+
+        Returns:
+            A tuple of tensors of shape (n_envs, H, W, 3) if rgb is not None,
+            otherwise a list of tensors of shape (n_envs, H, W) if depth is not None.
+            If n_envs == 0, the first dimension of the tensor is squeezed.
+        """
+        if self._visualizer.batch_renderer is None:
+            gs.raise_exception("Method only supported by 'BatchRenderer'")
+
+        rgb_out, depth_out, seg_out, normal_out = self._visualizer.batch_renderer.render(
+            rgb, depth, segmentation, normal, antialiasing, force_render
+        )
+        if segmentation and colorize_seg:
+            seg_out = tuple(self._visualizer.batch_renderer.colorize_seg_idxc_arr(seg) for seg in seg_out)
+        return rgb_out, depth_out, seg_out, normal_out
 
     @gs.assert_built
     def clear_debug_object(self, object):
@@ -1057,6 +1220,104 @@ class Scene(RBC):
         self._backward_ready = False
         self._forward_ready = False
 
+    def dump_ckpt_to_numpy(self) -> dict[str, np.ndarray]:
+        """
+        Collect every Taichi field in the **scene and its active solvers** and
+        return them as a flat ``{key: ndarray}`` dictionary.
+
+        Returns
+        -------
+        dict[str, np.ndarray]
+            Mapping ``"Class.attr[.member]" → array`` with raw field data.
+        """
+        arrays: dict[str, np.ndarray] = {}
+
+        for name, value in self.__dict__.items():
+            if isinstance(value, (ti.Field, ti.Ndarray)):
+                arrays[".".join((self.__class__.__name__, name))] = value.to_numpy()
+
+        for solver in self.active_solvers:
+            arrays.update(solver.dump_ckpt_to_numpy())
+
+        return arrays
+
+    def save_checkpoint(self, path: str | os.PathLike) -> None:
+        """
+        Pickle the full physics state to *one* file.
+
+        Parameters
+        ----------
+        path : str | os.PathLike
+            Destination filename.
+        """
+        state = {
+            "timestamp": time.time(),
+            "step_index": self.t,
+            "arrays": self.dump_ckpt_to_numpy(),
+        }
+        with open(path, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load_checkpoint(self, path: str | os.PathLike) -> None:
+        """
+        Restore a file produced by :py:meth:`save_checkpoint`.
+
+        Parameters
+        ----------
+        path : str | os.PathLike
+            Path to the checkpoint pickle.
+        """
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+
+        arrays = state["arrays"]
+
+        for name, value in self.__dict__.items():
+            if isinstance(value, (ti.Field, ti.Ndarray)):
+                key = ".".join((self.__class__.__name__, name))
+                if key in arrays:
+                    value.from_numpy(arrays[key])
+
+        for solver in self.active_solvers:
+            solver.load_ckpt_from_numpy(arrays)
+
+        self._t = state.get("step_index", self._t)
+
+    # ------------------------------------------------------------------------------------
+    # ----------------------------------- utilities --------------------------------------
+    # ------------------------------------------------------------------------------------
+
+    def _sanitize_envs_idx(self, envs_idx, *, unsafe=False):
+        # Handling default argument and special cases
+        if envs_idx is None:
+            return self._envs_idx
+
+        if self.n_envs == 0:
+            gs.raise_exception("`envs_idx` is not supported for non-parallelized scene.")
+
+        if isinstance(envs_idx, slice):
+            return self._envs_idx[envs_idx]
+        if isinstance(envs_idx, (int, np.integer)):
+            return self._envs_idx[envs_idx : envs_idx + 1]
+
+        # Early return if unsafe
+        if unsafe:
+            return envs_idx
+
+        # Perform a bunch of sanity checks
+        _envs_idx = torch.as_tensor(envs_idx, dtype=gs.tc_int, device=gs.device).contiguous()
+        if _envs_idx is not envs_idx:
+            gs.logger.debug(ALLOCATE_TENSOR_WARNING)
+        _envs_idx = torch.atleast_1d(_envs_idx)
+
+        if _envs_idx.ndim != 1:
+            gs.raise_exception("Expecting a 1D tensor for `envs_idx`.")
+
+        if (_envs_idx < 0).any() or (_envs_idx >= self.n_envs).any():
+            gs.raise_exception("`envs_idx` exceeds valid range.")
+
+        return _envs_idx
+
     # ------------------------------------------------------------------------------------
     # ----------------------------------- properties -------------------------------------
     # ------------------------------------------------------------------------------------
@@ -1087,7 +1348,7 @@ class Scene(RBC):
         return self._sim.requires_grad
 
     @property
-    def is_built(self):
+    def is_built(self) -> bool:
         """Whether the scene has been built."""
         return self._is_built
 
@@ -1133,7 +1394,7 @@ class Scene(RBC):
         return self._sim.active_solvers
 
     @property
-    def entities(self):
+    def entities(self) -> list[Entity]:
         """All the entities in the scene."""
         return self._sim.entities
 
@@ -1176,3 +1437,18 @@ class Scene(RBC):
     def pbd_solver(self):
         """The scene's `pbd_solver`, managing all the `PBDEntity` in the scene."""
         return self._sim.pbd_solver
+
+    @property
+    def segmentation_idx_dict(self):
+        """
+        Returns a dictionary mapping segmentation indices to scene entities.
+
+        In the segmentation map:
+        - Index 0 corresponds to the background (-1).
+        - Indices > 0 correspond to scene elements, which may be represented as:
+            - `entity_id`
+            - `(entity_id, link_id)`
+            - `(entity_id, link_id, geom_id)`
+          depending on the material type and the configured segmentation level.
+        """
+        return self._visualizer.segmentation_idx_dict

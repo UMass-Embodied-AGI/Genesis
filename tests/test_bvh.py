@@ -1,54 +1,62 @@
-import taichi as ti
-import torch
 import numpy as np
-import genesis as gs
+import pytest
 
+import genesis as gs
 from genesis.engine.bvh import LBVH, AABB
 
-import pytest
 from .utils import assert_allclose
+
+
+pytestmark = [
+    pytest.mark.field_only,
+]
 
 
 @pytest.fixture(scope="function")
 def lbvh():
     """Fixture for a LBVH tree"""
 
-    n_aabbs = 20
+    n_aabbs = 500
     n_batches = 10
     aabb = AABB(n_batches=n_batches, n_aabbs=n_aabbs)
-    min = np.random.rand(n_batches, n_aabbs, 3).astype(np.float32)
+    min = np.random.rand(n_batches, n_aabbs, 3).astype(np.float32) * 20.0
     max = min + np.random.rand(n_batches, n_aabbs, 3).astype(np.float32)
 
     aabb.aabbs.min.from_numpy(min)
     aabb.aabbs.max.from_numpy(max)
 
-    lbvh = LBVH(aabb)
+    lbvh = LBVH(aabb, max_n_query_result_per_aabb=32)
     lbvh.build()
+
     return lbvh
 
 
+@pytest.mark.required
 def test_morton_code(lbvh):
     morton_codes = lbvh.morton_codes.to_numpy()
+
     # Check that the morton codes are sorted
     for i_b in range(morton_codes.shape[0]):
         for i in range(1, morton_codes.shape[1]):
             assert (
-                morton_codes[i_b, i] > morton_codes[i_b, i - 1]
+                morton_codes[i_b, i, 0] > morton_codes[i_b, i - 1, 0]
             ), f"Morton codes are not sorted: {morton_codes[i_b, i]} < {morton_codes[i_b, i - 1]}"
 
 
-@ti.kernel
-def expand_bits(lbvh: ti.template(), x: ti.template(), expanded_x: ti.template()):
-    n_x = x.shape[0]
-    for i in range(n_x):
-        expanded_x[i] = lbvh.expand_bits(x[i])
-
-
+@pytest.mark.required
 def test_expand_bits():
     """
     Test the expand_bits function for LBVH.
     A 10-bit integer is expanded to a 30-bit integer by inserting two zeros before each bit.
     """
+    import gstaichi as ti
+
+    @ti.kernel
+    def expand_bits(lbvh: ti.template(), x: ti.template(), expanded_x: ti.template()):
+        n_x = x.shape[0]
+        for i in range(n_x):
+            expanded_x[i] = lbvh.expand_bits(x[i])
+
     # random integer
     x_np = np.random.randint(0, 1024, (10,), dtype=np.uint32)
     x_ti = ti.field(ti.uint32, shape=x_np.shape)
@@ -70,6 +78,8 @@ def test_expand_bits():
         ), f"Expected {str_expanded_x}, got {''.join(f'00{bit}' for bit in str_x)}"
 
 
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_build_tree(lbvh):
     nodes = lbvh.nodes.to_numpy()
     n_aabbs = lbvh.n_aabbs
@@ -116,13 +126,23 @@ def test_build_tree(lbvh):
                 assert_allclose(parent_max, parent_max_expected, atol=1e-6, rtol=1e-5)
 
 
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 def test_query(lbvh):
+    import gstaichi as ti
+
+    @ti.kernel
+    def query_kernel(lbvh: ti.template(), aabbs: ti.template()):
+        lbvh.query(aabbs)
+
     aabbs = lbvh.aabbs
 
     # Query the tree
-    lbvh.query(aabbs)
+    query_kernel(lbvh, aabbs)
 
     query_result_count = lbvh.query_result_count.to_numpy()
+    if query_result_count > lbvh.max_query_results:
+        raise ValueError(f"Query result count {query_result_count} exceeds max_query_results {lbvh.max_query_results}")
     query_result = lbvh.query_result.to_numpy()
 
     n_aabbs = lbvh.n_aabbs

@@ -1,5 +1,5 @@
 import numpy as np
-import taichi as ti
+import gstaichi as ti
 import genesis as gs
 from genesis.engine.states.solvers import AvatarSolverState
 
@@ -79,26 +79,36 @@ class AvatarSolver(RigidSolver):
             self._func_forward_kinematics(i_b)
             self._func_update_geoms(i_b)
 
+    @ti.func
+    def _func_detect_collision(self):
+        self.collider.clear()
+        self.collider.detection()
+
     def get_state(self, f):
         if self.is_active():
-            state = AvatarSolverState(self._scene)
-            self._kernel_get_state(state.qpos,
-                                   state.dofs_vel,
-                                   state.links_pos,
-                                   state.links_quat,
-                                   state.i_pos_shift,
-                                   state.mass_shift,
-                                   state.friction_ratio,
+            state = AvatarSolverState(self.scene)
+            self._kernel_get_state(
+                state.qpos,
+                state.dofs_vel,
+                state.links_pos,
+                state.links_quat,
+                links_state=self.links_state,
+                dofs_state=self.dofs_state,
+                geoms_state=self.geoms_state,
+                rigid_global_info=self._rigid_global_info,
+                static_rigid_sim_config=self._static_rigid_sim_config,
             )
         else:
             state = None
         return state
 
-    def detect_collision(self, env_idx=0):
-        # TODO: support batching
-        self._kernel_detect_collision()
-        n_collision = self.collider.n_contacts.to_numpy()[env_idx]
-        collision_pairs = np.empty((n_collision, 2), dtype=np.int32)
-        collision_pairs[:, 0] = self.collider.contact_data.geom_a.to_numpy()[:n_collision, env_idx]
-        collision_pairs[:, 1] = self.collider.contact_data.geom_b.to_numpy()[:n_collision, env_idx]
-        return collision_pairs
+    def print_contact_data(self):
+        batch_idx = 0
+        n_contacts = self.collider._collider_state.n_contacts[batch_idx]
+        print("collision_pairs:")
+        if n_contacts > 0:
+            contact_data = self.collider._collider_state.contact_data.to_numpy()
+            links_a = contact_data["link_a"][:n_contacts, batch_idx]
+            links_b = contact_data["link_b"][:n_contacts, batch_idx]
+            link_pairs = np.vstack([links_a, links_b]).T
+            print(link_pairs)

@@ -157,19 +157,11 @@ class Raytracer:
         self.lights = []
         for light in options.lights:
             light_intensity = light.get("intensity", 1.0)
-            self.lights.append(
-                SphereLight(
-                    radius=light["radius"],
-                    pos=light["pos"],
-                    surface=gs.surfaces.Emission(
-                        color=(
-                            light["color"][0] * light_intensity,
-                            light["color"][1] * light_intensity,
-                            light["color"][2] * light_intensity,
-                        ),
-                    ),
-                )
+            light_surface = gs.surfaces.Emission(
+                color=map(lambda x: x * light_intensity, light["color"]),
             )
+            light_surface.update_texture()
+            self.lights.append(SphereLight(radius=light["radius"], pos=light["pos"], surface=light_surface))
 
         LuisaRenderPy.init(
             context_path=LRP_PATH,
@@ -179,7 +171,7 @@ class Raytracer:
             log_level=logging_class[self.logging_level],
         )
 
-    def add_mesh_light(self, mesh, color, intensity, pos, quat, revert_dir=False, double_sided=False, beam_angle=180.0):
+    def add_mesh_light(self, mesh, color, intensity, pos, quat, revert_dir=False, double_sided=False, cutoff=180.0):
         color = np.array(color)
         if color.ndim != 1 or (color.shape[0] != 3 and color.shape[0] != 4):
             gs.raise_exception("Light color should have shape (3,) or (4,).")
@@ -196,7 +188,7 @@ class Raytracer:
                         color[2] * intensity,
                     ),
                     double_sided=double_sided,
-                    beam_angle=beam_angle,
+                    cutoff=cutoff,
                 ),
                 name=str(mesh.uid),
                 revert_dir=revert_dir,
@@ -251,9 +243,9 @@ class Raytracer:
             for tool_entity in self.sim.tool_solver.entities:
                 self.add_rigid(
                     name=str(tool_entity.uid),
-                    vertices=tool_entity.mesh.init_vertices_np,
+                    vertices=tool_entity.mesh.raw_vertices,
                     triangles=tool_entity.mesh.faces_np,
-                    normals=tool_entity.mesh.init_vertex_normals_np,
+                    normals=tool_entity.mesh.raw_vertex_normals,
                     uvs=np.array([]),
                 )
 
@@ -375,7 +367,7 @@ class Raytracer:
                 name=f"emis_{shape_name}",
                 emission=self.get_texture(surface.get_emission()),
                 two_sided=False if surface.double_sided is None else surface.double_sided,
-                beam_angle=surface.beam_angle,
+                beam_angle=surface.cutoff,
             )
             self._scene.update_emission(emission_luisa)
         else:
@@ -604,7 +596,7 @@ class Raytracer:
         if camera_model == "pinhole":
             self._cameras[camera_name] = LuisaRenderPy.PinholeCamera(
                 name=camera_name,
-                pose=self.get_transform(camera.transform),
+                pose=self.get_transform(np.eye(4)),
                 film=LuisaRenderPy.Film(resolution=camera.res),
                 filter=LuisaRenderPy.Filter(),
                 spp=camera.spp,
@@ -613,7 +605,7 @@ class Raytracer:
         elif camera_model == "thinlens":
             self._cameras[camera_name] = LuisaRenderPy.ThinLensCamera(
                 name=camera_name,
-                pose=self.get_transform(camera.transform),
+                pose=self.get_transform(np.eye(4)),
                 film=LuisaRenderPy.Film(resolution=camera.res),
                 filter=LuisaRenderPy.Filter(),
                 spp=camera.spp,
@@ -629,12 +621,13 @@ class Raytracer:
     def update_camera(self, camera):
         camera_name = str(camera.uid)
         camera_model = camera.model
+        camera_transform = camera.transform
 
         if camera_model == "pinhole":
-            self._cameras[camera_name].update(pose=self.get_transform(camera.transform), fov=camera.fov)
+            self._cameras[camera_name].update(pose=self.get_transform(camera_transform), fov=camera.fov)
         elif camera_model == "thinlens":
             self._cameras[camera_name].update(
-                pose=self.get_transform(camera.transform),
+                pose=self.get_transform(camera_transform),
                 aperture=camera.aperture,
                 focal_len=camera.focal_len * 1000,
                 focus_dis=camera.focus_dist,

@@ -3,10 +3,19 @@ import pytest
 
 import genesis as gs
 
+from .utils import assert_allclose
 
+
+pytestmark = [
+    pytest.mark.field_only,
+]
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 1, 2])
 @pytest.mark.parametrize("muscle_material", [gs.materials.MPM.Muscle, gs.materials.FEM.Muscle])
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_muscle(muscle_material, show_viewer):
+def test_muscle(n_envs, muscle_material, show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=5e-4,
@@ -29,6 +38,7 @@ def test_muscle(muscle_material, show_viewer):
         show_viewer=show_viewer,
         show_FPS=False,
     )
+
     scene.add_entity(
         morph=gs.morphs.Plane(),
         material=gs.materials.Rigid(
@@ -54,7 +64,10 @@ def test_muscle(muscle_material, show_viewer):
             ),
         ),
     )
-    scene.build()
+    if n_envs > 0:
+        scene.build(n_envs=n_envs)
+    else:
+        scene.build()
 
     if isinstance(worm.material, gs.materials.MPM.Muscle):
         pos = worm.get_state().pos[0]
@@ -84,10 +97,14 @@ def test_muscle(muscle_material, show_viewer):
 
     scene.reset()
     for i in range(200):
-        worm.set_actuation(np.array([0.0, 0.0, 0.0, 1.0 * (0.5 + np.sin(0.005 * np.pi * i))]))
+        actuation = np.array([0.0, 0.0, 0.0, 1.0 * (0.5 + np.sin(0.005 * np.pi * i))])
+        if n_envs > 1:
+            actuation = np.tile(actuation, (n_envs, 1))
+        worm.set_actuation(actuation)
         scene.step()
 
 
+@pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.gpu])
 def test_deformable_parallel(show_viewer):
     scene = gs.Scene(
@@ -97,11 +114,6 @@ def test_deformable_parallel(show_viewer):
         ),
         pbd_options=gs.options.PBDOptions(
             particle_size=1e-2,
-        ),
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3.5, 0.0, 2.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=40,
         ),
         sph_options=gs.options.SPHOptions(
             lower_bound=(-0.03, -0.03, -0.08),
@@ -114,27 +126,28 @@ def test_deformable_parallel(show_viewer):
             lower_bound=(0.5, -0.1, -0.05),
             upper_bound=(0.7, 0.1, 0.3),
         ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(3.5, 0.0, 2.5),
+            camera_lookat=(0.0, 0.0, 0.5),
+            camera_fov=40,
+        ),
         vis_options=gs.options.VisOptions(
             rendered_envs_idx=[1],
         ),
         show_viewer=show_viewer,
     )
 
-    ########################## entities ##########################
-    frictionless_rigid = gs.materials.Rigid(needs_coup=True, coup_friction=0.0)
-
     plane = scene.add_entity(
-        material=frictionless_rigid,
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.0,
+        ),
         morph=gs.morphs.Plane(),
     )
-
-    path_cloth = "meshes/cloth.obj"
-
-    # pbd
     cloth = scene.add_entity(
         material=gs.materials.PBD.Cloth(),
         morph=gs.morphs.Mesh(
-            file=path_cloth,
+            file="meshes/cloth.obj",
             scale=0.6,
             pos=(0.0, 0.8, 0.3),
             euler=(180.0, 0.0, 0.0),
@@ -143,8 +156,6 @@ def test_deformable_parallel(show_viewer):
             color=(0.2, 0.4, 0.8, 1.0),
         ),
     )
-
-    # sph
     water = scene.add_entity(
         material=gs.materials.SPH.Liquid(),
         morph=gs.morphs.Box(
@@ -153,11 +164,8 @@ def test_deformable_parallel(show_viewer):
         ),
         surface=gs.surfaces.Default(
             color=(0.2, 0.6, 1.0, 1.0),
-            vis_mode="particle",
         ),
     )
-
-    # mpm
     mpm_cube = scene.add_entity(
         material=gs.materials.MPM.Elastic(rho=200),
         morph=gs.morphs.Box(
@@ -166,44 +174,28 @@ def test_deformable_parallel(show_viewer):
         ),
         surface=gs.surfaces.Default(
             color=(0.9, 0.8, 0.2, 1.0),
-            vis_mode="particle",
         ),
     )
 
-    # fem
-    E, nu = 3.0e4, 0.45
-    rho = 1000.0
     entity_fem = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.8, 0.8, 0.1),
             size=(0.1, 0.1, 0.1),
         ),
         material=gs.materials.FEM.Elastic(
-            E=E,
-            nu=nu,
-            rho=rho,
+            E=3.0e4,
+            nu=0.45,
+            rho=1000.0,
             model="stable_neohookean",
         ),
     )
-
-    ########################## build ##########################
     scene.build(n_envs=4)
 
-    horizon = 2000
-
-    for i in range(horizon):
+    for i in range(2000):
         scene.step()
 
-    # speed is around 0
-    vel = cloth._solver.get_state(0).vel.cpu().numpy()
-    np.testing.assert_allclose(vel, 0, atol=1e-2)
-
-    vel = water._solver.get_state(0).vel.cpu().numpy()
-    # it's harder for fluids to be static
-    np.testing.assert_allclose(vel, 0, atol=4e-2)
-
-    vel = mpm_cube._solver.get_state(0).vel.cpu().numpy()
-    np.testing.assert_allclose(vel, 0, atol=1e-2)
-
-    vel = entity_fem._solver.get_state(0).vel.cpu().numpy()
-    np.testing.assert_allclose(vel, 0, atol=1e-2)
+    assert_allclose(cloth._solver.get_state(0).vel, 0, atol=1e-2)
+    assert_allclose(mpm_cube._solver.get_state(0).vel, 0, atol=1e-2)
+    assert_allclose(entity_fem._solver.get_state(0).vel, 0, atol=1e-2)
+    # FIXME: It is harder for fluids to be static
+    assert_allclose(water._solver.get_state(0).vel, 0, atol=5e-2)

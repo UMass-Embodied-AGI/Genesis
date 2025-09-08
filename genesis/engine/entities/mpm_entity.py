@@ -1,5 +1,5 @@
 import numpy as np
-import taichi as ti
+import gstaichi as ti
 import torch
 
 import genesis as gs
@@ -89,14 +89,9 @@ class MPMEntity(ParticleEntity):
         f : int
             The current substep index.
         pos : gs.Tensor
-            A tensor of shape (n_particles, 3) representing particle positions.
+            A tensor of shape (n_envs, n_particles, 3) representing particle positions.
         """
-        self.solver._kernel_set_particles_pos(
-            f,
-            self._particle_start,
-            self._n_particles,
-            pos,
-        )
+        self.solver._kernel_set_particles_pos(f, self._particle_start, self._n_particles, pos)
 
     def set_pos_grad(self, f, pos_grad):
         """
@@ -297,14 +292,14 @@ class MPMEntity(ParticleEntity):
             if actu.shape == (n_groups,):
                 self._tgt["actu"] = actu.reshape((1, 1, -1)).tile((self._sim._B, self.n_particles, 1))
                 is_valid = True
-            elif actu.shape == (n_particles,):
+            elif actu.shape == (self.n_particles,):
                 self._tgt["actu"] = actu.reshape((1, -1, 1)).tile((self._sim._B, 1, n_groups))
                 is_valid = True
         elif actu.ndim == 2:
             if actu.shape == (self._sim._B, n_groups):
                 self._tgt["actu"] = actu.unsqueeze(1).tile((1, self.n_particles, 1))
                 is_valid = True
-            if actu.shape == (self._sim._B, n_particles):
+            if actu.shape == (self._sim._B, self.n_particles):
                 self._tgt["actu"] = actu.unsqueeze(2).tile((1, 1, n_groups))
                 is_valid = True
         elif actu.ndim == 3:
@@ -373,7 +368,7 @@ class MPMEntity(ParticleEntity):
         """
         self._assert_active()
 
-        free = gs.zeros((self._n_particles,), dtype=int, requires_grad=False, scene=self._scene)
+        free = gs.zeros((self._n_particles,), dtype=gs.tc_bool, requires_grad=False, scene=self._scene)
         self.solver._kernel_get_free(
             self._particle_start,
             self._n_particles,
@@ -644,10 +639,10 @@ class MPMEntity(ParticleEntity):
 
     @ti.kernel
     def _kernel_get_particles(self, f: ti.i32, pos: ti.types.ndarray()):
-        for i_p, i_b in range(self.n_particles, self._sim._B):
-            i_global = i_p + self._particle_start
+        for i_p_, i_b in ti.ndrange(self.n_particles, self._sim._B):
+            i_p = i_p_ + self._particle_start
             for j in ti.static(range(3)):
-                pos[i_b, i, j] = self._solver.particles[f, i_global, i_b].pos[j]
+                pos[i_b, i_p_, j] = self._solver.particles[f, i_p, i_b].pos[j]
 
     @gs.assert_built
     def get_state(self):
