@@ -8,9 +8,10 @@ import types
 import shutil
 import sys
 import os
+import weakref
 from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Any, Type, NoReturn, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, NoReturn, Optional, Type
 
 import numpy as np
 import cpuinfo
@@ -326,6 +327,39 @@ def is_approx_multiple(a, b, tol=1e-7):
     return abs(a % b) < tol or abs(b - (a % b)) < tol
 
 
+def concat_with_tensor(
+    tensor: torch.Tensor, value, expand: tuple[int, ...] | None = None, dtype: torch.dtype | None = None, dim: int = 0
+):
+    """Helper method to concatenate a value (not necessarily a tensor) with a tensor."""
+    if not isinstance(value, torch.Tensor):
+        value = torch.tensor([value], dtype=dtype or gs.tc_float, device=gs.device)
+    if expand is not None:
+        value = value.expand(*expand)
+    if tensor.numel() == 0:
+        return value
+    return torch.cat([tensor, value], dim=dim)
+
+
+def make_tensor_field(shape: tuple[int, ...] = (), dtype_factory: Callable[[], torch.dtype] = lambda: gs.tc_float):
+    """
+    Helper method to create a tensor field for dataclasses.
+
+    Parameters
+    ----------
+    shape : tuple
+        The shape of the tensor field.
+    dtype_factory : Callable[[], torch.dtype], optional
+        The factory function to create the dtype of the tensor field. Default is gs.tc_float.
+        A factory is used because gs types may not be available at the time of field creation.
+    """
+
+    def _default_factory():
+        nonlocal shape, dtype_factory
+        return torch.empty(shape, dtype=dtype_factory(), device=gs.device)
+
+    return field(default_factory=_default_factory)
+
+
 # -------------------------------------- TAICHI SPECIALIZATION --------------------------------------
 
 ALLOCATE_TENSOR_WARNING = (
@@ -333,7 +367,7 @@ ALLOCATE_TENSOR_WARNING = (
     "impede performance if it occurs in the critical path of your application."
 )
 
-TI_PROG_ID: int = -1
+TI_PROG_WEAKREF: weakref.ReferenceType | None = None
 TI_DATA_CACHE: OrderedDict[int, "FieldMetadata"] = OrderedDict()
 MAX_CACHE_SIZE = 1000
 
@@ -436,6 +470,14 @@ def _launch_kernel(self, t_kernel, compiled_kernel_data, *args):
         raise e from None
 
 
+def _destroy_callback(ref: weakref.ReferenceType):
+    global TI_PROG_WEAKREF
+    TI_DATA_CACHE.clear()
+    for kernel in TO_EXT_ARR_FAST_MAP.values():
+        kernel._primal.mapper.mapping.clear()
+    TI_PROG_WEAKREF = None
+
+
 _to_pytorch_type_fast = functools.lru_cache(maxsize=None)(to_pytorch_type)
 TO_EXT_ARR_FAST_MAP = {}
 for data_type, func in (
@@ -472,15 +514,11 @@ def ti_to_torch(
     Returns:
         torch.tensor: The result torch tensor.
     """
-    global TI_PROG_ID
+    global TI_PROG_WEAKREF
 
-    # Clear cache if taichi runtime has been restarted
-    prog_id = id(impl.get_runtime().prog)
-    if TI_PROG_ID != prog_id:
-        TI_DATA_CACHE.clear()
-        for kernel in TO_EXT_ARR_FAST_MAP.values():
-            kernel._primal.mapper.mapping.clear()
-        TI_PROG_ID = prog_id
+    # Keep track of taichi runtime to automatically clear cache if destroyed
+    if TI_PROG_WEAKREF is None:
+        TI_PROG_WEAKREF = weakref.ref(impl.get_runtime().prog, _destroy_callback)
 
     # Get metadata
     ti_data_id = id(value)

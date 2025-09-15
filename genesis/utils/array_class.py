@@ -129,6 +129,8 @@ class StructConstraintState:
     efc_D: V_ANNOTATION
     efc_frictionloss: V_ANNOTATION
     efc_force: V_ANNOTATION
+    efc_b: V_ANNOTATION
+    efc_AR: V_ANNOTATION
     active: V_ANNOTATION
     prev_active: V_ANNOTATION
     qfrc_constraint: V_ANNOTATION
@@ -169,6 +171,18 @@ def get_constraint_state(constraint_solver, solver):
             "Consider reducing the number of constraints or the number of degrees of freedom."
         )
 
+    if solver._static_rigid_sim_config.noslip_iterations > 0:
+        if len_constraints_ * len_constraints_ * f_batch()[0] > 2 * 10**9:
+            gs.logger.warning(
+                f"efc_AR shape {len_constraints_}x{len_constraints_}x{f_batch()[0]} is very large. Consider manually "
+                f"set a smaller 'max_collision_pairs' in RigidOptions to reduce the size of reserved memory. "
+            )
+        efc_AR_shape = solver._batch_shape((len_constraints_, len_constraints_))
+        efc_b_shape = solver._batch_shape(len_constraints_)
+    else:
+        efc_AR_shape = 1
+        efc_b_shape = 1
+
     kwargs = {
         "n_constraints": V(dtype=gs.ti_int, shape=f_batch()),
         "ti_n_equalities": V(gs.ti_int, shape=solver._batch_shape()),
@@ -189,6 +203,8 @@ def get_constraint_state(constraint_solver, solver):
         "efc_D": V(dtype=gs.ti_float, shape=solver._batch_shape(len_constraints_)),
         "efc_frictionloss": V(dtype=gs.ti_float, shape=solver._batch_shape(len_constraints_)),
         "efc_force": V(dtype=gs.ti_float, shape=solver._batch_shape(len_constraints_)),
+        "efc_b": V(dtype=gs.ti_float, shape=efc_b_shape),
+        "efc_AR": V(dtype=gs.ti_float, shape=efc_AR_shape),
         "active": V(dtype=gs.ti_bool, shape=solver._batch_shape(len_constraints_)),
         "prev_active": V(dtype=gs.ti_int, shape=solver._batch_shape(len_constraints_)),
         "qfrc_constraint": V(dtype=gs.ti_float, shape=solver._batch_shape(solver.n_dofs_)),
@@ -528,7 +544,10 @@ def get_collider_info(solver, n_vert_neighbors, collider_static_config):
     terrain_hf_shape = 1
     if collider_static_config.has_terrain:
         links_idx = solver.geoms_info.link_idx.to_numpy()[solver.geoms_info.type.to_numpy() == gs.GEOM_TYPE.TERRAIN]
-        entity = solver._entities[solver.links_info.entity_idx.to_numpy()[links_idx[0]]]
+        entity_idx = solver.links_info.entity_idx.to_numpy()[links_idx[0]]
+        if isinstance(entity_idx, np.ndarray):
+            entity_idx = entity_idx[0]
+        entity = solver._entities[entity_idx]
         terrain_hf_shape = entity.terrain_hf.shape
 
     kwargs = {
