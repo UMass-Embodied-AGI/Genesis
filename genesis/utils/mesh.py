@@ -1366,7 +1366,7 @@ type_to_count = {
     "MAT4": (16, [4, 4]),
 }
 
-def create_plane(size=1000, color=None, normal=(0, 0, 1)):
+def create_plane(normal=(0.0, 0.0, 1.0), plane_size=(1e3, 1e3), tile_size=(1, 1), color=None):
     thickness = 1e-2  # for safety
     mesh = trimesh.creation.box(extents=[plane_size[0], plane_size[1], thickness])
     mesh.vertices[:, 2] -= thickness / 2
