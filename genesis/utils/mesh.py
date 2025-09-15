@@ -5,8 +5,6 @@ import os
 import pickle as pkl
 from functools import lru_cache
 from pathlib import Path
-from urllib import request
-from io import BytesIO
 
 import numpy as np
 import trimesh
@@ -16,9 +14,12 @@ import Imath
 
 import coacd
 import igl
-import pygltflib
+
 import genesis as gs
 
+from urllib import request
+from io import BytesIO
+import pygltflib
 from tqdm import tqdm
 
 from . import geom as gu
@@ -36,16 +37,20 @@ from .misc import (
 
 MESH_REPAIR_ERROR_THRESHOLD = 0.01
 
+
 class MeshInfo:
-    def __init__(self, surface=None):
-        self.surface = surface
-        self.verts = list()
-        self.faces = list()
-        self.normals = list()
-        self.uvs = list()
+    def __init__(self):
+        self.surface = None
+        self.metadata = {}
+        self.verts = []
+        self.faces = []
+        self.normals = []
+        self.uvs = []
         self.n_points = 0
-        self.n_members = 0
-        self.uvs_exist = False
+
+    def set_property(self, surface=None, metadata=None):
+        self.surface = surface
+        self.metadata = metadata
 
     def append(self, verts, faces, normals, uvs):
         faces += self.n_points
@@ -53,10 +58,7 @@ class MeshInfo:
         self.faces.append(faces)
         self.normals.append(normals)
         self.uvs.append(uvs)
-        self.n_points += verts.shape[0]
-        self.n_members += 1
-        if uvs is not None:
-            self.uvs_exist = True
+        self.n_points += len(verts)
 
     def export_mesh(self, scale):
         if self.uvs:
@@ -79,11 +81,9 @@ class MeshInfo:
             uvs=uvs,
             scale=scale,
         )
+        mesh.metadata.update(self.metadata)
         return mesh
 
-    def set_property(self, surface=None, metadata=None):
-        self.surface = surface
-        self.metadata = metadata
 
 class MeshInfoGroup:
     def __init__(self):
@@ -96,11 +96,6 @@ class MeshInfoGroup:
             mesh_info = self.infos.setdefault(name, MeshInfo())
             first_created = True
         return mesh_info, first_created
-
-    def append(self, name, verts, faces, normals, uvs, surface):
-        if name not in self.infos:
-            self.infos[name] = MeshInfo(surface)
-        self.infos[name].append(verts, faces, normals, uvs)
 
     def export_meshes(self, scale):
         return [mesh_info.export_mesh(scale) for mesh_info in self.infos.values()]
@@ -242,8 +237,6 @@ def voxelize_mesh(mesh, res):
 
 def surface_uvs_to_trimesh_visual(surface, uvs=None, n_verts=None):
     texture = surface.get_rgba()
-    texture.check_dim(3)
-    # texture = surface.get_texture()
 
     if isinstance(texture, gs.textures.ImageTexture):
         if uvs is not None:
@@ -253,7 +246,7 @@ def surface_uvs_to_trimesh_visual(surface, uvs=None, n_verts=None):
             visual = trimesh.visual.TextureVisuals(
                 uv=uvs,
                 material=trimesh.visual.material.SimpleMaterial(
-                    texture.image_array, diffuse=(1.0, 1.0, 1.0, 1.0)
+                    image=Image.fromarray(texture.image_array), diffuse=(1.0, 1.0, 1.0, 1.0)
                 ),
             )
         else:
@@ -350,7 +343,7 @@ def postprocess_collision_geoms(
                 tmesh._cache.clear()
                 tmesh.visual._cache.clear()
 
-    # Check if all the geometries can be convexify without decomposition
+    # Check if all the geometries can be convexified without decomposition
     must_decompose = False
     if convexify:
         for g_info in g_infos:
@@ -528,15 +521,6 @@ def create_texture(image, factor, encoding):
     else:
         return None
 
-def opacity_from_texture(color_texture, alpha_cutoff=None):
-    opacity_texture = color_texture.check_dim(3)
-    if opacity_texture is not None:
-        if alpha_cutoff is not None:
-            opacity_texture.apply_cutoff(alpha_cutoff)
-        if isinstance(opacity_texture, gs.textures.ImageTexture) and opacity_texture.image_array.max() == opacity_texture.image_array.min():
-            alpha = opacity_texture.image_array.max() / 255.0
-            opacity_texture = create_texture(None, (alpha,), 'linear')
-    return opacity_texture
 
 def apply_transform(transform, positions, normals=None):
     transformed_positions = (np.column_stack([positions, np.ones(len(positions))]) @ transform)[:, :3]
