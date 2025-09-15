@@ -348,7 +348,7 @@ class Renderer(object):
         if hasattr(self, "skybox_nodes"):
             return
         import os
-        import cv2
+        import imageio.v2 as iio
         from trimesh import Trimesh
         from trimesh.visual.texture import TextureVisuals
         from .texture import Texture
@@ -380,8 +380,36 @@ class Renderer(object):
         cube_map_filenames = ["Back", "Right", "Front", "Left", "Bottom", "Top"]
         textures = []
         for i in cube_map_filenames:
-            source_img = cv2.cvtColor(cv2.imread(os.path.join(os.path.dirname(gs.__file__), "assets/textures/skybox/", "FluffballDay{}.hdr".format(i))), cv2.COLOR_BGR2RGB)
-            texture = Texture(source=source_img, source_channels='RGB')
+            hdr_path = os.path.join(os.path.dirname(gs.__file__), "assets/textures/skybox/", f"FluffballDay{i}.hdr")
+            try:
+                img = iio.imread(hdr_path)  # Expect float HDR in RGB order
+                if img is None:
+                    raise ValueError(f"Failed to read HDR: {hdr_path}")
+                img = np.asarray(img)
+                # Ensure 3 channels
+                if img.ndim == 2:
+                    img = np.repeat(img[:, :, None], 3, axis=2)
+                elif img.shape[2] > 3:
+                    img = img[:, :, :3]
+                # Normalize floats to 0..1 if needed, then to uint8
+                if np.issubdtype(img.dtype, np.floating):
+                    vmax = float(np.max(img)) if img.size > 0 else 1.0
+                    if not np.isfinite(vmax) or vmax <= 0:
+                        vmax = 1.0
+                    # If values seem already in 0..1, skip scaling
+                    if vmax > 1.0:
+                        img = img / vmax
+                    img_u8 = np.clip(img, 0.0, 1.0)
+                    img_u8 = (img_u8 * 255.0 + 0.5).astype(np.uint8)
+                else:
+                    # For integer inputs, cast to uint8 and clip
+                    img_u8 = np.clip(img, 0, 255).astype(np.uint8)
+            except Exception as e:
+                # Fallback to a simple gray texture if HDR loading fails
+                gs.logger.warning(f"Skybox HDR load failed for {hdr_path}: {e}. Using fallback texture.")
+                img_u8 = np.full((8, 8, 3), 127, dtype=np.uint8)
+
+            texture = Texture(source=img_u8, source_channels='RGB')
             textures.append(texture)
 
         self.skybox_nodes = []
