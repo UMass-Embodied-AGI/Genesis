@@ -39,8 +39,8 @@ MESH_REPAIR_ERROR_THRESHOLD = 0.01
 
 
 class MeshInfo:
-    def __init__(self):
-        self.surface = None
+    def __init__(self, surface=None):
+        self.surface = surface
         self.metadata = {}
         self.verts = []
         self.faces = []
@@ -96,6 +96,11 @@ class MeshInfoGroup:
             mesh_info = self.infos.setdefault(name, MeshInfo())
             first_created = True
         return mesh_info, first_created
+    
+    def append(self, name, verts, faces, normals, uvs, surface):
+        if name not in self.infos:
+            self.infos[name] = MeshInfo(surface)
+        self.infos[name].append(verts, faces, normals, uvs)
 
     def export_meshes(self, scale):
         return [mesh_info.export_mesh(scale) for mesh_info in self.infos.values()]
